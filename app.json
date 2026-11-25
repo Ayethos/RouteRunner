@@ -6,11 +6,11 @@
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "ios": {
-      "bundleIdentifier": "com.example.unlockmap",
+      "bundleIdentifier": "com.jesseandmatt.unlockmap",
       "supportsTablet": false
     },
     "android": {
-      "package": "com.example.unlockmap"
+      "package": "com.jesseandmatt.unlockmap"
     },
     "plugins": [
       "expo-dev-client",
