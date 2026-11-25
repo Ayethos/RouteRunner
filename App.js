@@ -10,22 +10,7 @@ const PINK = '#FF2D95';
 const ROAD_WHITE = '#FFFFFF';
 const PANEL = 'rgba(20,20,22,0.92)';
 
-// Grayscale base map. Swap for a vector style (MapTiler/Mapbox) before launch.
-const MAP_STYLE = {
-  version: 8,
-  sources: {
-    base: {
-      type: 'raster',
-      tiles: ['https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png'],
-      tileSize: 256,
-      attribution: '© OpenStreetMap contributors © CARTO',
-    },
-  },
-  layers: [
-    { id: 'bg', type: 'background', paint: { 'background-color': '#161616' } },
-    { id: 'base', type: 'raster', source: 'base', paint: { 'raster-saturation': -1 } },
-  ],
-};
+const MAP_STYLE = 'https://tiles.openfreemap.org/styles/liberty';
 
 const TRAIL_KEY = 'trail:matched:v1';
 const MATCH_INTERVAL_MS = 30_000;
@@ -289,7 +274,7 @@ export default function App() {
           followUserLocation={follow}
           followUserMode="normal"
           followZoomLevel={15}
-          defaultSettings={{ zoomLevel: 14 }}
+          defaultSettings={{ centerCoordinate: [0, 20], zoomLevel: 2 }}
         />
         <MapLibreGL.UserLocation visible androidRenderMode="normal" />
 
