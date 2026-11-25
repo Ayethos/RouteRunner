@@ -127,9 +127,16 @@ async function planRoadRoute(points) {
     });
     if (!response.ok) throw new Error('Route request failed');
     const result = await response.json();
-    const geometry = result.features?.[0]?.geometry;
-    if (geometry?.type !== 'MultiLineString') return [];
-    return geometry.coordinates.filter((line) => line.length > 1);
+    const feature = result.features?.[0];
+    const geometry = feature?.geometry;
+    if (geometry?.type !== 'MultiLineString') return { lines: [], steps: [] };
+    const steps = (feature.properties?.legs ?? []).flatMap((leg, index) =>
+      (leg.steps ?? []).flatMap((step) => {
+        const point = geometry.coordinates[index]?.[step.from_index];
+        return point && step.instruction?.text ? [{ point, text: step.instruction.text }] : [];
+      })
+    );
+    return { lines: geometry.coordinates.filter((line) => line.length > 1), steps };
   } finally {
     clearTimeout(timeout);
   }
@@ -178,6 +185,29 @@ export default function App() {
   const [destination, setDestination] = useState(null);
   const [routePreview, setRoutePreview] = useState(null);
   const currentPoint = useRef(null);
+  const [searchNear, setSearchNear] = useState(null);
+  const [navigation, setNavigation] = useState(null);
+  const [navPoint, setNavPoint] = useState(null);
+
+  useEffect(() => {
+    if (!navigation || navigation.arrived) return;
+    let previousPoint;
+    const timer = setInterval(() => {
+      const point = currentPoint.current;
+      if (!point || point === previousPoint) return;
+      previousPoint = point;
+      setNavPoint(point);
+      setNavigation((state) => {
+        if (!state || state.arrived) return state;
+        const step = state.steps[state.index];
+        if (distM(point, step.point) > 35) return state;
+        return state.index + 1 < state.steps.length
+          ? { ...state, index: state.index + 1 }
+          : { ...state, arrived: true };
+      });
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [navigation?.arrived, navigation?.lines]);
   const [savingRoute, setSavingRoute] = useState(false);
   const savingRouteRef = useRef(false);
 
@@ -451,12 +481,12 @@ export default function App() {
     savingRouteRef.current = true;
     setSavingRoute(true);
     try {
-      const lines = await planRoadRoute([start, destination.point]);
+      const { lines } = await planRoadRoute([start, destination.point]);
       if (!lines.length) {
         Alert.alert('No driving route found', 'Try a different start or destination.');
         return;
       }
-      setRoutePreview({ name: destination.label, lines });
+      setRoutePreview({ name: destination.label, lines, waypoints: [start, destination.point] });
       setSelectedRide(null);
       setAddressPlanner(false);
       showOnMap(lines);
@@ -494,12 +524,12 @@ export default function App() {
     savingRouteRef.current = true;
     setSavingRoute(true);
     try {
-      const lines = await planRoadRoute(draft);
+      const { lines } = await planRoadRoute(draft);
       if (!lines.length) {
         Alert.alert('No driving route found', 'Move a waypoint closer to a road and try again.');
         return;
       }
-      const next = [...routes, { id: String(Date.now()), name: `Route ${routes.length + 1}`, lines }];
+      const next = [...routes, { id: String(Date.now()), name: `Route ${routes.length + 1}`, lines, waypoints: draft }];
       await AsyncStorage.setItem(ROUTES_KEY, JSON.stringify(next));
       setRoutes(next);
       setDraft([]);
@@ -526,6 +556,66 @@ export default function App() {
     requestAnimationFrame(() => {
       cameraRef.current?.fitBounds([bounds.east, bounds.north], [bounds.west, bounds.south], 70, 450);
     });
+  };
+
+  const openPlanner = () => {
+    setSearchNear(currentPoint.current);
+    setAddressPlanner(true);
+  };
+
+  const startDirections = async (route) => {
+    if (savingRouteRef.current) return;
+    const here = currentPoint.current;
+    if (!here || !GEOAPIFY_TEST_KEY) {
+      Alert.alert('Directions unavailable', here ? 'This build needs a Geoapify key.' : 'Wait for a GPS fix and try again.');
+      return;
+    }
+    const lastPoint = (route.lines ?? [route.line]).at(-1)?.at(-1);
+    const remaining = route.waypoints?.slice(1) ?? (lastPoint ? [lastPoint] : []);
+    if (!remaining.length) return;
+    savingRouteRef.current = true;
+    setSavingRoute(true);
+    try {
+      const { lines, steps } = await planRoadRoute([here, ...remaining]);
+      if (!lines.length || !steps.length) {
+        Alert.alert('Directions unavailable', 'No turn instructions were returned for this route.');
+        return;
+      }
+      const end = lines.at(-1).at(-1);
+      if (distM(steps.at(-1).point, end) > 10) steps.push({ point: end, text: 'Continue to your destination' });
+      setSelectedRide(null);
+      setRoutePreview(null);
+      setLibraryView(null);
+      setNavPoint(here);
+      setNavigation({ lines, steps, index: steps.length > 1 && distM(here, steps[0].point) <= 35 ? 1 : 0 });
+      setFollow(true);
+    } catch {
+      Alert.alert('Could not start directions', 'Check your connection and try again.');
+    } finally {
+      savingRouteRef.current = false;
+      setSavingRoute(false);
+    }
+  };
+
+  const deleteRoute = (route) => {
+    Alert.alert('Delete saved route?', route.name, [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Delete', style: 'destructive', onPress: async () => {
+        if (savingRouteRef.current) return;
+        savingRouteRef.current = true;
+        setSavingRoute(true);
+        try {
+          const next = routes.filter(({ id }) => id !== route.id);
+          await AsyncStorage.setItem(ROUTES_KEY, JSON.stringify(next));
+          setRoutes(next);
+        } catch {
+          Alert.alert('Could not delete route', 'Try again.');
+        } finally {
+          savingRouteRef.current = false;
+          setSavingRoute(false);
+        }
+      } },
+    ]);
   };
 
   const openRide = (ride) => {
@@ -607,7 +697,12 @@ export default function App() {
           </MapLibreGL.ShapeSource>
         )}
 
-        {routePreview && (
+        {navigation && (
+          <MapLibreGL.ShapeSource id="navigation-route" shape={fc(navigation.lines)}>
+            <MapLibreGL.LineLayer id="navigation-core" style={{ ...pinkLayerStyle.core, lineWidth: 6 }} />
+          </MapLibreGL.ShapeSource>
+        )}
+        {routePreview && !navigation && (
           <MapLibreGL.ShapeSource id="address-preview" shape={fc(routePreview.lines)}>
             <MapLibreGL.LineLayer id="address-preview-core" style={pinkLayerStyle.core} />
           </MapLibreGL.ShapeSource>
@@ -651,6 +746,17 @@ export default function App() {
           </View>
         )}
 
+        {navigation && (
+          <View style={styles.banner}>
+            <Text style={styles.rowTitle}>{navigation.arrived ? 'Destination reached' : navigation.steps[navigation.index].text}</Text>
+            {!navigation.arrived && navPoint && (
+              <Text style={styles.rowDetail}>{formatDistance(distM(navPoint, navigation.steps[navigation.index].point))} to maneuver</Text>
+            )}
+            <Pressable accessibilityRole="button" style={styles.retryButton} onPress={() => setNavigation(null)}>
+              <Text style={styles.retryText}>End directions</Text>
+            </Pressable>
+          </View>
+        )}
         {mapFailed && (
           <View style={styles.banner}>
             <Text style={styles.bannerText}>Map could not load. Check your connection and try again.</Text>
@@ -706,11 +812,17 @@ export default function App() {
           </Text>
         )}
 
+        {routePreview && !navigation && (
+          <View style={styles.startDirections}>
+            <Pill label={savingRoute ? 'Loading…' : 'Start directions'} primary disabled={savingRoute}
+              onPress={() => startDirections(routePreview)} />
+          </View>
+        )}
         {/* Bottom controls */}
         <View style={styles.bottomRow} pointerEvents="box-none">
-          {routePreview ? (
+          {routePreview && !navigation ? (
             <>
-              <Pill label="Edit" disabled={savingRoute} onPress={() => setAddressPlanner(true)} />
+              <Pill label="Edit" disabled={savingRoute} onPress={openPlanner} />
               <Pill label="Close" disabled={savingRoute} onPress={() => setRoutePreview(null)} />
               <Pill label="Save route" primary disabled={savingRoute} onPress={saveAddressRoute} />
             </>
@@ -722,7 +834,7 @@ export default function App() {
             </>
           ) : (
             <>
-              <RoundBtn label="Route" onPress={() => setAddressPlanner(true)} />
+              <RoundBtn label="Route" onPress={openPlanner} />
               <Pill label={riding ? 'End ride' : 'Start ride'} primary onPress={riding ? endRide : startRide} />
               <RoundBtn
                 label="Locate"
@@ -745,11 +857,11 @@ export default function App() {
             <Pill label="Close" disabled={savingRoute} onPress={() => setAddressPlanner(false)} />
           </View>
           <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.libraryList}>
-            <PlaceSearch key={originReset} title="From" placeholder="Current location" selected={origin}
+            <PlaceSearch key={originReset} near={searchNear} title="From" placeholder="Current location" selected={origin}
               onSelect={(place) => { setOrigin(place); setOriginNeedsSelection(false); }}
               onEdit={(value) => setOriginNeedsSelection(Boolean(value.trim()))} disabled={savingRoute} />
             {(origin || originNeedsSelection) && <Pill label="Use current location" disabled={savingRoute} onPress={() => { setOrigin(null); setOriginNeedsSelection(false); setOriginReset((value) => value + 1); }} />}
-            <PlaceSearch title="To" placeholder="Search address or place" selected={destination}
+            <PlaceSearch near={origin?.point ?? searchNear} title="To" placeholder="Search address or place" selected={destination}
               onSelect={setDestination} disabled={savingRoute} />
             <Pill label={savingRoute ? "Finding roads…" : "Show route"} primary
               disabled={!destination || originNeedsSelection || savingRoute} onPress={previewAddressRoute} />
@@ -771,13 +883,19 @@ export default function App() {
           <ScrollView contentContainerStyle={styles.libraryList}>
             {libraryView === 'routes' ? (
               routes.length ? routes.map((route) => (
-                <Pressable accessibilityRole="button" key={route.id} style={styles.libraryRow} onPress={() => {
-                  setSelectedRide(null);
-                  showOnMap(route.lines ?? [route.line]);
-                }}>
+                <View key={route.id} style={styles.libraryRow}>
                   <Text style={styles.rowTitle}>{route.name}</Text>
-                  <Text style={styles.rowDetail}>Show on map</Text>
-                </Pressable>
+                  <Pressable accessibilityRole="button" disabled={savingRoute} style={styles.placeResult}
+                    onPress={() => { setSelectedRide(null); setNavigation(null); showOnMap(route.lines ?? [route.line]); }}>
+                    <Text style={styles.rowDetail}>Show on map</Text>
+                  </Pressable>
+                  <Pressable accessibilityRole="button" disabled={savingRoute} style={styles.placeResult} onPress={() => startDirections(route)}>
+                    <Text style={styles.retryText}>{savingRoute ? 'Working…' : 'Start directions'}</Text>
+                  </Pressable>
+                  <Pressable accessibilityRole="button" disabled={savingRoute} style={styles.placeResult} onPress={() => deleteRoute(route)}>
+                    <Text style={styles.rowDetail}>Delete route</Text>
+                  </Pressable>
+                </View>
               )) : <Text style={styles.rowDetail}>No saved routes yet. Use Route on the map to plan one.</Text>
             ) : (
               rides.length ? [...rides].sort((a, b) => b.date - a.date).map((ride, index) => (
@@ -797,8 +915,9 @@ export default function App() {
   );
 }
 
-async function searchPlaces(query, signal) {
-  const params = `text=${encodeURIComponent(query)}&format=json&limit=5&apiKey=${encodeURIComponent(GEOAPIFY_TEST_KEY)}`;
+async function searchPlaces(query, near, signal) {
+  const bias = near ? `&bias=${encodeURIComponent(`proximity:${near.join(',')}`)}` : '';
+  const params = `text=${encodeURIComponent(query)}&format=json&limit=5${bias}&apiKey=${encodeURIComponent(GEOAPIFY_TEST_KEY)}`;
   const response = await fetch(`https://api.geoapify.com/v1/geocode/autocomplete?${params}`, { signal });
   if (!response.ok) throw new Error('Place search failed');
   const result = await response.json();
@@ -807,7 +926,7 @@ async function searchPlaces(query, signal) {
     .map(({ formatted, lon, lat }) => ({ label: formatted, point: [lon, lat] }));
 }
 
-function PlaceSearch({ title, placeholder, selected, onSelect, onEdit, disabled }) {
+function PlaceSearch({ near, title, placeholder, selected, onSelect, onEdit, disabled }) {
   const [query, setQuery] = useState(selected?.label ?? '');
   const [results, setResults] = useState([]);
   const [status, setStatus] = useState('');
@@ -827,7 +946,7 @@ function PlaceSearch({ title, placeholder, selected, onSelect, onEdit, disabled 
     const timer = setTimeout(async () => {
       setStatus('Searching…');
       try {
-        const places = await searchPlaces(query.trim(), controller.signal);
+        const places = await searchPlaces(query.trim(), near, controller.signal);
         if (controller.signal.aborted) return;
         setResults(places);
         setStatus(places.length ? '' : 'No places found.');
@@ -839,7 +958,7 @@ function PlaceSearch({ title, placeholder, selected, onSelect, onEdit, disabled 
       clearTimeout(timer);
       controller.abort();
     };
-  }, [query, selected, disabled]);
+  }, [query, selected, disabled, near]);
 
   return (
     <View style={styles.libraryRow}>
@@ -890,6 +1009,7 @@ function Stat({ label, value }) {
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#161616' },
   topRow: { flexDirection: 'row', paddingHorizontal: 16, paddingTop: 8 },
+  startDirections: { alignSelf: 'center', marginBottom: 8 },
   bottomRow: {
     flexDirection: 'row',
     alignItems: 'center',
