@@ -1,0 +1,23 @@
+{
+  "expo": {
+    "name": "Unlock Map",
+    "slug": "unlock-map",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "bundleIdentifier": "com.example.unlockmap",
+      "supportsTablet": false
+    },
+    "android": {
+      "package": "com.example.unlockmap"
+    },
+    "plugins": [
+      "expo-dev-client",
+      "@maplibre/maplibre-react-native",
+      ["expo-location", {
+        "locationWhenInUsePermission": "Unlock Map uses your location to show you on the map and reveal the roads you ride."
+      }]
+    ]
+  }
+}
