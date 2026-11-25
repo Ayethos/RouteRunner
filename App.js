@@ -28,6 +28,7 @@ const MAP_STYLE = {
 };
 
 const TRAIL_KEY = 'trail:matched:v1';
+const MATCH_INTERVAL_MS = 30_000;
 const MATCH_URL = process.env.EXPO_PUBLIC_OSRM_URL?.replace(/\/+$/, '');
 const ROUTES_KEY = 'routes:v1';
 const RIDES_KEY = 'rides:v1';
@@ -145,16 +146,12 @@ export default function App() {
       const { longitude, latitude, accuracy } = loc.coords;
       const pt = [longitude, latitude];
       const prev = lastPtRef.current;
-      if (MATCH_URL && accuracy > 0 && accuracy <= 30) {
+      if (ridingRef.current && MATCH_URL && accuracy > 0 && accuracy <= 30) {
         const seconds = Math.floor(loc.timestamp / 1000);
-        const last = pendingSamples.current.at(-1);
-        if (last && (seconds - last.seconds > 30 || distM(last.point, pt) > 200)) {
-          flushSamples();
-        }
         const previousSample = pendingSamples.current.at(-1);
-        if (!previousSample || (seconds > previousSample.seconds && distM(previousSample.point, pt) >= 10)) {
+        if (!previousSample ||
+            (seconds - previousSample.seconds >= 2 && distM(previousSample.point, pt) >= 10)) {
           pendingSamples.current.push({ point: pt, seconds, accuracy: Math.max(5, Math.round(accuracy)) });
-          if (pendingSamples.current.length >= 5) flushSamples(true);
         }
       }
 
@@ -172,7 +169,7 @@ export default function App() {
         statsRef.current.top = Math.max(statsRef.current.top, sp);
       }
     },
-    [flushSamples]
+    []
   );
 
   // location watcher
@@ -207,6 +204,14 @@ export default function App() {
     return () => clearInterval(id);
   }, [riding]);
 
+  useEffect(() => {
+    if (!riding || !MATCH_URL) return;
+    const timer = setInterval(() => {
+      if (ridingRef.current) flushSamples(true);
+    }, MATCH_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, [riding, flushSamples]);
+
   const startRide = () => {
     statsRef.current = { seconds: 0, meters: 0, speed: 0, top: 0 };
     rideLineRef.current = [];
@@ -219,6 +224,7 @@ export default function App() {
   const endRide = async () => {
     ridingRef.current = false;
     setRiding(false);
+    flushSamples();
     const s = statsRef.current;
     const summary = { date: Date.now(), ...s, line: rideLineRef.current };
     try {
@@ -227,7 +233,6 @@ export default function App() {
       all.push(summary);
       await AsyncStorage.setItem(RIDES_KEY, JSON.stringify(all));
     } catch (e) {}
-    flushSamples();
     Alert.alert(
       'Ride complete',
       `Time ${fmtTime(s.seconds)}\nDistance ${(s.meters / 1000).toFixed(2)} km\nTop speed ${kmh(s.top)} km/h`
