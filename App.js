@@ -115,6 +115,28 @@ async function matchRoads(samples) {
   }
 }
 
+function distanceFromRoute(point, lines) {
+  const lonScale = 111_195 * Math.cos(toRad(point[1]));
+  const project = ([lon, lat]) => [
+    (((lon - point[0] + 540) % 360) - 180) * lonScale,
+    (lat - point[1]) * 111_195,
+  ];
+  let nearest = Infinity;
+  for (const line of lines) {
+    let [ax, ay] = project(line[0]);
+    for (const vertex of line.slice(1)) {
+      const [bx, by] = project(vertex);
+      const dx = bx - ax;
+      const dy = by - ay;
+      const lengthSquared = dx * dx + dy * dy;
+      const ratio = lengthSquared ? Math.max(0, Math.min(1, -(ax * dx + ay * dy) / lengthSquared)) : 0;
+      nearest = Math.min(nearest, Math.hypot(ax + ratio * dx, ay + ratio * dy));
+      [ax, ay] = [bx, by];
+    }
+  }
+  return nearest;
+}
+
 async function planRoadRoute(points) {
   // The Routing API takes latitude first. The response uses GeoJSON order.
   const waypoints = points.map(([lon, lat]) => `${lat},${lon}`).join('|');
@@ -140,6 +162,19 @@ async function planRoadRoute(points) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function buildDirections(here, remaining) {
+  const { lines, steps } = await planRoadRoute([here, ...remaining]);
+  if (!lines.length || !steps.length) return null;
+  const end = lines.at(-1).at(-1);
+  if (distM(steps.at(-1).point, end) > 10) {
+    steps.push({ point: end, text: 'Continue to your destination' });
+  }
+  return {
+    lines, steps, remaining,
+    index: steps.length > 1 && distM(here, steps[0].point) <= 35 ? 1 : 0,
+  };
 }
 
 // ---- App -----------------------------------------------------------------
@@ -188,17 +223,58 @@ export default function App() {
   const [searchNear, setSearchNear] = useState(null);
   const [navigation, setNavigation] = useState(null);
   const [navPoint, setNavPoint] = useState(null);
+  const navigationFix = useRef(null);
+  const [rerouteStatus, setRerouteStatus] = useState(null);
 
+  const activeLines = navigation?.lines;
+  const arrived = navigation?.arrived;
+  const remainingStops = navigation?.remaining;
   useEffect(() => {
-    if (!navigation || navigation.arrived) return;
-    let previousPoint;
-    const timer = setInterval(() => {
-      const point = currentPoint.current;
-      if (!point || point === previousPoint) return;
-      previousPoint = point;
+    if (!activeLines || arrived) return;
+    let active = true;
+    let previousFix;
+    let offRouteFixes = 0;
+    let lastRequest = 0;
+    let rerouting = false;
+    let remaining = remainingStops;
+    const timer = setInterval(async () => {
+      const fix = navigationFix.current;
+      if (!fix || fix === previousFix || Date.now() - fix.timestamp > 10_000) return;
+      if (previousFix && fix.timestamp - previousFix.timestamp > 10_000) offRouteFixes = 0;
+      previousFix = fix;
+      const { point, accuracy } = fix;
       setNavPoint(point);
+      if (remaining.length > 1 && distM(point, remaining[0]) <= 35) {
+        remaining = remaining.slice(1);
+      }
+
+      const offRoute = distanceFromRoute(point, activeLines) > Math.max(55, accuracy * 2);
+      offRouteFixes = offRoute ? offRouteFixes + 1 : 0;
+      if (offRouteFixes >= 3 && !rerouting && Date.now() - lastRequest >= 15_000) {
+        lastRequest = Date.now();
+        rerouting = true;
+        setRerouteStatus('Finding a new route…');
+        try {
+          const updated = await buildDirections(point, remaining);
+          if (!active) return;
+          if (!offRouteFixes) {
+            setRerouteStatus(null);
+            return;
+          }
+          if (!updated) throw new Error('No replacement route');
+          setNavigation((state) => state?.lines === activeLines ? updated : state);
+          setRerouteStatus(null);
+        } catch {
+          if (active) setRerouteStatus('Could not reroute. Retrying if you stay off route.');
+        } finally {
+          rerouting = false;
+        }
+        return;
+      }
+      if (offRoute || rerouting) return;
+      setRerouteStatus(null);
       setNavigation((state) => {
-        if (!state || state.arrived) return state;
+        if (!state || state.lines !== activeLines || state.arrived) return state;
         const step = state.steps[state.index];
         if (distM(point, step.point) > 35) return state;
         return state.index + 1 < state.steps.length
@@ -206,8 +282,11 @@ export default function App() {
           : { ...state, arrived: true };
       });
     }, 1000);
-    return () => clearInterval(timer);
-  }, [navigation?.arrived, navigation?.lines]);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [activeLines, arrived, remainingStops]);
   const [savingRoute, setSavingRoute] = useState(false);
   const savingRouteRef = useRef(false);
 
@@ -311,6 +390,10 @@ export default function App() {
           { accuracy: Location.Accuracy.BestForNavigation, distanceInterval: 5, timeInterval: 1000 },
           (location) => {
             currentPoint.current = [location.coords.longitude, location.coords.latitude];
+            const { accuracy } = location.coords;
+            if (accuracy > 0 && accuracy <= 35) {
+              navigationFix.current = { point: currentPoint.current, accuracy, timestamp: location.timestamp };
+            }
             if (!backgroundRideRef.current) onLocation(location);
           }
         );
@@ -576,18 +659,17 @@ export default function App() {
     savingRouteRef.current = true;
     setSavingRoute(true);
     try {
-      const { lines, steps } = await planRoadRoute([here, ...remaining]);
-      if (!lines.length || !steps.length) {
+      const directions = await buildDirections(here, remaining);
+      if (!directions) {
         Alert.alert('Directions unavailable', 'No turn instructions were returned for this route.');
         return;
       }
-      const end = lines.at(-1).at(-1);
-      if (distM(steps.at(-1).point, end) > 10) steps.push({ point: end, text: 'Continue to your destination' });
       setSelectedRide(null);
       setRoutePreview(null);
       setLibraryView(null);
       setNavPoint(here);
-      setNavigation({ lines, steps, index: steps.length > 1 && distM(here, steps[0].point) <= 35 ? 1 : 0 });
+      setRerouteStatus(null);
+      setNavigation(directions);
       setFollow(true);
     } catch {
       Alert.alert('Could not start directions', 'Check your connection and try again.');
@@ -748,8 +830,8 @@ export default function App() {
 
         {navigation && (
           <View style={styles.banner}>
-            <Text style={styles.rowTitle}>{navigation.arrived ? 'Destination reached' : navigation.steps[navigation.index].text}</Text>
-            {!navigation.arrived && navPoint && (
+            <Text style={styles.rowTitle}>{navigation.arrived ? 'Destination reached' : rerouteStatus ?? navigation.steps[navigation.index].text}</Text>
+            {!navigation.arrived && !rerouteStatus && navPoint && (
               <Text style={styles.rowDetail}>{formatDistance(distM(navPoint, navigation.steps[navigation.index].point))} to maneuver</Text>
             )}
             <Pressable accessibilityRole="button" style={styles.retryButton} onPress={() => setNavigation(null)}>
