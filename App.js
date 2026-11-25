@@ -12,7 +12,7 @@ const PINK = '#FF2D95';
 const ROAD_WHITE = '#FFFFFF';
 const PANEL = 'rgba(20,20,22,0.92)';
 
-const MAP_STYLE = 'https://tiles.openfreemap.org/styles/liberty';
+const MAP_STYLE = 'https://tiles.openfreemap.org/styles/dark';
 
 const TRAIL_KEY = 'trail:matched:v1';
 const MATCH_INTERVAL_MS = 30_000;
