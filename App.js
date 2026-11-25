@@ -1,7 +1,9 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { View, Text, Pressable, StyleSheet, Alert, SafeAreaView, Modal, ScrollView } from 'react-native';
+import { View, Text, Pressable, StyleSheet, Alert, SafeAreaView, Modal, ScrollView, Platform } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import * as Location from 'expo-location';
+import * as TaskManager from 'expo-task-manager';
+import { getLocales } from 'expo-localization';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import MapLibreGL from '@maplibre/maplibre-react-native';
 
@@ -17,6 +19,26 @@ const MATCH_INTERVAL_MS = 30_000;
 const GEOAPIFY_TEST_KEY = process.env.EXPO_PUBLIC_GEOAPIFY_TEST_KEY?.trim();
 const ROUTES_KEY = 'routes:v1';
 const RIDES_KEY = 'rides:v1';
+const BACKGROUND_TASK = 'route-runner-ride-location';
+const ACTIVE_RIDE_KEY = 'active-ride:v1';
+
+let backgroundWrites = Promise.resolve();
+TaskManager.defineTask(BACKGROUND_TASK, async ({ data, error }) => {
+  if (error || !data?.locations?.length) return;
+  const write = backgroundWrites.then(async () => {
+    const raw = await AsyncStorage.getItem(ACTIVE_RIDE_KEY);
+    if (!raw) return;
+    const session = JSON.parse(raw);
+    const locations = data.locations.filter((location) => location.timestamp >= session.startedAt);
+    if (!locations.length) return;
+    const key = `${ACTIVE_RIDE_KEY}:${session.startedAt}`;
+    const saved = await AsyncStorage.getItem(key);
+    const points = saved ? JSON.parse(saved) : [];
+    await AsyncStorage.setItem(key, JSON.stringify([...points, ...locations]));
+  });
+  backgroundWrites = write.catch(() => {});
+  await write;
+});
 
 // ---- Helpers -------------------------------------------------------------
 const toRad = (d) => (d * Math.PI) / 180;
@@ -50,7 +72,13 @@ const fmtTime = (s) => {
   const m = Math.floor(s / 60);
   return `${m}:${String(s % 60).padStart(2, '0')}`;
 };
-const kmh = (ms) => Math.max(0, Math.round((ms || 0) * 3.6));
+const region = getLocales()[0]?.regionCode;
+const useMiles = region === 'US' || region === 'GB';
+const distanceUnit = useMiles ? 'mi' : 'km';
+const speedUnit = useMiles ? 'mph' : 'km/h';
+const formatDistance = (meters) => `${(meters / (useMiles ? 1609.344 : 1000)).toFixed(2)} ${distanceUnit}`;
+const formatSpeed = (metersPerSecond) => `${Math.max(0, Math.round((metersPerSecond || 0) * (useMiles ? 2.236936 : 3.6)))} ${speedUnit}`;
+const averageSpeed = ({ meters, seconds }) => seconds > 0 ? meters / seconds : 0;
 
 async function matchRoads(samples) {
   const waypoints = samples.map(({ point, seconds }) => ({
@@ -131,6 +159,9 @@ export default function App() {
   const ridingRef = useRef(false);
   const rideStartedAt = useRef(0);
   const finishingRideRef = useRef(false);
+  const backgroundRideRef = useRef(false);
+  const lastRecordedTime = useRef(0);
+  const [screenLockRecording, setScreenLockRecording] = useState(false);
   const [stats, setStats] = useState({ seconds: 0, meters: 0, speed: 0, top: 0 });
   const statsRef = useRef({ seconds: 0, meters: 0, speed: 0, top: 0 });
   const rideLineRef = useRef([]);
@@ -185,11 +216,23 @@ export default function App() {
 
   const onLocation = useCallback(
     (loc) => {
+      if (!ridingRef.current || loc.timestamp < rideStartedAt.current ||
+          loc.timestamp <= lastRecordedTime.current) return;
       const { longitude, latitude, accuracy } = loc.coords;
+      if (!(accuracy > 0 && accuracy <= 30)) return;
+      const gap = loc.timestamp - lastRecordedTime.current;
+      lastRecordedTime.current = loc.timestamp;
+      if (gap > 30_000) {
+        lastPtRef.current = null;
+        flushSamples();
+      }
       const pt = [longitude, latitude];
       const prev = lastPtRef.current;
-      if (ridingRef.current && GEOAPIFY_TEST_KEY && accuracy > 0 && accuracy <= 30) {
+      if (GEOAPIFY_TEST_KEY) {
         const seconds = Math.floor(loc.timestamp / 1000);
+        if (pendingSamples.current.length && seconds - pendingSamples.current[0].seconds >= 30) {
+          flushSamples(true);
+        }
         const previousSample = pendingSamples.current.at(-1);
         if (!previousSample ||
             (seconds - previousSample.seconds >= 2 && distM(previousSample.point, pt) >= 10)) {
@@ -199,7 +242,7 @@ export default function App() {
 
       if (!prev || distM(prev, pt) >= 10) {
         if (ridingRef.current) {
-          if (prev) statsRef.current.meters += distM(prev, pt);
+          if (prev && distM(prev, pt) <= 200) statsRef.current.meters += distM(prev, pt);
           rideLineRef.current.push(pt);
         }
         lastPtRef.current = pt;
@@ -211,7 +254,7 @@ export default function App() {
         statsRef.current.top = Math.max(statsRef.current.top, sp);
       }
     },
-    []
+    [flushSamples]
   );
 
   // location watcher
@@ -227,7 +270,7 @@ export default function App() {
         if (status !== 'granted') return;
         sub = await Location.watchPositionAsync(
           { accuracy: Location.Accuracy.BestForNavigation, distanceInterval: 5, timeInterval: 1000 },
-          onLocation
+          (location) => { if (!backgroundRideRef.current) onLocation(location); }
         );
         if (!active) sub.remove();
       } catch {
@@ -240,15 +283,42 @@ export default function App() {
     };
   }, [onLocation, trailLoaded]);
 
+  const drainBackground = useCallback(async () => {
+    const startedAt = rideStartedAt.current;
+    await backgroundWrites;
+    const raw = await AsyncStorage.getItem(`${ACTIVE_RIDE_KEY}:${startedAt}`);
+    if (!raw || startedAt !== rideStartedAt.current || !ridingRef.current) return;
+    JSON.parse(raw).sort((a, b) => a.timestamp - b.timestamp).forEach(onLocation);
+  }, [onLocation]);
+
+  useEffect(() => {
+    if (!trailLoaded || Platform.OS !== 'ios') return;
+    (async () => {
+      const raw = await AsyncStorage.getItem(ACTIVE_RIDE_KEY);
+      if (!raw || ridingRef.current || finishingRideRef.current) return;
+      const { startedAt } = JSON.parse(raw);
+      const active = await Location.hasStartedLocationUpdatesAsync(BACKGROUND_TASK);
+      if (ridingRef.current || finishingRideRef.current) return;
+      rideStartedAt.current = startedAt;
+      backgroundRideRef.current = active;
+      ridingRef.current = true;
+      setScreenLockRecording(active);
+      setRiding(true);
+      await drainBackground();
+    })().catch(() => {});
+  }, [trailLoaded, drainBackground]);
+
   // ride timer
   useEffect(() => {
     if (!riding) return;
-    const id = setInterval(() => {
+    const id = setInterval(async () => {
+      if (backgroundRideRef.current) await drainBackground().catch(() => {});
+      if (!ridingRef.current) return;
       statsRef.current.seconds = Math.floor((Date.now() - rideStartedAt.current) / 1000);
       setStats({ ...statsRef.current });
     }, 1000);
     return () => clearInterval(id);
-  }, [riding]);
+  }, [riding, drainBackground]);
 
   useEffect(() => {
     if (!riding || !GEOAPIFY_TEST_KEY) return;
@@ -258,7 +328,7 @@ export default function App() {
     return () => clearInterval(timer);
   }, [riding, flushSamples]);
 
-  const startRide = () => {
+  const startRide = async () => {
     if (ridingRef.current || finishingRideRef.current) return;
     if (locationFailed) {
       Alert.alert('GPS unavailable', 'Check that Location Services are enabled, then reopen RouteRunner.');
@@ -268,8 +338,33 @@ export default function App() {
       Alert.alert('Location needed', 'Allow location access to start recording a ride.');
       return;
     }
+    finishingRideRef.current = true;
+    let backgroundEnabled = false;
+    let startedAt = Date.now();
+    if (Platform.OS === 'ios') {
+      try {
+        const { granted } = await Location.requestBackgroundPermissionsAsync();
+        startedAt = Date.now();
+        if (granted) {
+          await AsyncStorage.setItem(ACTIVE_RIDE_KEY, JSON.stringify({ startedAt }));
+          await Location.startLocationUpdatesAsync(BACKGROUND_TASK, {
+            accuracy: Location.Accuracy.BestForNavigation,
+            distanceInterval: 5,
+            activityType: Location.ActivityType.AutomotiveNavigation,
+            pausesUpdatesAutomatically: false,
+            showsBackgroundLocationIndicator: true,
+          });
+          backgroundEnabled = true;
+        }
+      } catch {
+        await AsyncStorage.removeItem(ACTIVE_RIDE_KEY).catch(() => {});
+      }
+    }
+    backgroundRideRef.current = backgroundEnabled;
+    setScreenLockRecording(backgroundEnabled);
     setSelectedRide(null);
-    rideStartedAt.current = Date.now();
+    lastRecordedTime.current = 0;
+    rideStartedAt.current = startedAt;
     statsRef.current = { seconds: 0, meters: 0, speed: 0, top: 0 };
     rideLineRef.current = [];
     lastPtRef.current = null;
@@ -277,17 +372,31 @@ export default function App() {
     ridingRef.current = true;
     setRiding(true);
     setFollow(true);
+    finishingRideRef.current = false;
   };
 
   const endRide = async () => {
-    if (!ridingRef.current) return;
-    ridingRef.current = false;
+    if (!ridingRef.current || finishingRideRef.current) return;
     finishingRideRef.current = true;
+    try {
+      if (backgroundRideRef.current && await Location.hasStartedLocationUpdatesAsync(BACKGROUND_TASK)) {
+        await Location.stopLocationUpdatesAsync(BACKGROUND_TASK);
+      }
+      await drainBackground();
+    } catch {
+      finishingRideRef.current = false;
+      Alert.alert('Could not finish ride', 'Try ending the ride again.');
+      return;
+    }
+    backgroundRideRef.current = false;
+    setScreenLockRecording(false);
+    ridingRef.current = false;
     setRiding(false);
     flushSamples();
     const date = Date.now();
     const summary = {
       ...statsRef.current,
+      startedAt: rideStartedAt.current,
       date,
       seconds: Math.floor((date - rideStartedAt.current) / 1000),
       line: rideLineRef.current,
@@ -295,12 +404,13 @@ export default function App() {
     try {
       const raw = await AsyncStorage.getItem(RIDES_KEY);
       const all = raw ? JSON.parse(raw) : [];
-      const next = [summary, ...all];
+      const next = [summary, ...all.filter((ride) => ride.startedAt !== summary.startedAt)];
       await AsyncStorage.setItem(RIDES_KEY, JSON.stringify(next));
       setRides(next);
+      await AsyncStorage.multiRemove([ACTIVE_RIDE_KEY, `${ACTIVE_RIDE_KEY}:${rideStartedAt.current}`]).catch(() => {});
       Alert.alert(
         'Ride saved',
-        `Time ${fmtTime(summary.seconds)}\nDistance ${(summary.meters / 1000).toFixed(2)} km\nTop speed ${kmh(summary.top)} km/h`
+        `Time ${fmtTime(summary.seconds)}\nDistance ${formatDistance(summary.meters)}\nAverage speed ${formatSpeed(averageSpeed(summary))}\nTop speed ${formatSpeed(summary.top)}`
       );
     } catch {
       Alert.alert('Ride could not be saved', 'There was a problem writing to device storage.');
@@ -507,12 +617,18 @@ export default function App() {
           </View>
         )}
 
+        {riding && !screenLockRecording && (
+          <View style={styles.banner}>
+            <Text style={styles.bannerText}>Keep RouteRunner open to record this ride.</Text>
+          </View>
+        )}
         {riding && (
           <View style={styles.statsBar}>
             <Stat label="Time" value={fmtTime(stats.seconds)} />
-            <Stat label="Distance" value={`${(stats.meters / 1000).toFixed(2)} km`} />
-            <Stat label="Speed" value={`${kmh(stats.speed)}`} />
-            <Stat label="Top" value={`${kmh(stats.top)}`} />
+            <Stat label="Distance" value={formatDistance(stats.meters)} />
+            <Stat label="Speed" value={formatSpeed(stats.speed)} />
+            <Stat label="Average" value={formatSpeed(averageSpeed(stats))} />
+            <Stat label="Top" value={formatSpeed(stats.top)} />
           </View>
         )}
 
@@ -570,7 +686,7 @@ export default function App() {
                 <Pressable accessibilityRole="button" key={`${ride.date}-${index}`} style={styles.libraryRow} onPress={() => openRide(ride)}>
                   <Text style={styles.rowTitle}>{new Date(ride.date).toLocaleString()}</Text>
                   <Text style={styles.rowDetail}>
-                    {`${(ride.meters / 1000).toFixed(2)} km · ${fmtTime(ride.seconds)} · Top ${kmh(ride.top)} km/h`}
+                    {`${formatDistance(ride.meters)} · ${fmtTime(ride.seconds)}\nAvg ${formatSpeed(averageSpeed(ride))} · Top ${formatSpeed(ride.top)}`}
                   </Text>
                   <Text style={styles.rowDetail}>View recorded path</Text>
                 </Pressable>
@@ -648,7 +764,7 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     backgroundColor: PANEL,
   },
-  statValue: { color: '#fff', fontSize: 20, fontWeight: '700' },
+  statValue: { color: '#fff', fontSize: 14, fontWeight: '700' },
   statLabel: { color: '#9a9aa0', fontSize: 12, marginTop: 2 },
   banner: { margin: 16, padding: 12, borderRadius: 12, backgroundColor: PANEL },
   bannerText: { color: '#fff', fontSize: 14 },
