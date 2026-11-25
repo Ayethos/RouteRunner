@@ -79,6 +79,25 @@ const useMiles = region === 'US' || region === 'GB';
 const distanceUnit = useMiles ? 'mi' : 'km';
 const speedUnit = useMiles ? 'mph' : 'km/h';
 const formatDistance = (meters) => `${(meters / (useMiles ? 1609.344 : 1000)).toFixed(2)} ${distanceUnit}`;
+function formatTurnDistance(meters) {
+  const distance = Math.max(0, meters);
+  if (useMiles && distance < 160.9344) return `${Math.round(distance / 9.144) * 10} yd`;
+  if (!useMiles && distance < 1000) return `${Math.round(distance / 10) * 10} m`;
+  return `${(distance / (useMiles ? 1609.344 : 1000)).toFixed(1)} ${distanceUnit}`;
+}
+
+function maneuverArrow(type) {
+  if (type?.startsWith('DestinationReached')) return '⚑';
+  if (type === 'Roundabout') return '⟳';
+  if (type === 'TurnAroundLeft') return '↶';
+  if (type === 'TurnAroundRight') return '↷';
+  if (type === 'Left' || type === 'SharpLeft') return '↰';
+  if (type === 'Right' || type === 'SharpRight') return '↱';
+  if (type?.endsWith('Left')) return '↖';
+  if (type?.endsWith('Right')) return '↗';
+  return type === 'Straight' || type === 'StartAt' || type === 'Merge' ? '↑' : '•';
+}
+
 const formatSpeed = (metersPerSecond) => `${Math.max(0, Math.round((metersPerSecond || 0) * (useMiles ? 2.236936 : 3.6)))} ${speedUnit}`;
 const averageSpeed = ({ meters, seconds }) => seconds > 0 ? meters / seconds : 0;
 
@@ -163,7 +182,7 @@ function locateOnRoute(point, lines, offsets, previous) {
 async function planRoadRoute(points, includeSurfaces = false) {
   // The Routing API takes latitude first. The response uses GeoJSON order.
   const waypoints = points.map(([lon, lat]) => `${lat},${lon}`).join('|');
-  const query = `waypoints=${encodeURIComponent(waypoints)}&mode=drive&format=geojson${includeSurfaces ? '&details=route_details' : ''}&apiKey=${encodeURIComponent(GEOAPIFY_TEST_KEY)}`;
+  const query = `waypoints=${encodeURIComponent(waypoints)}&mode=drive&format=geojson&details=instruction_details${includeSurfaces ? ',route_details' : ''}&apiKey=${encodeURIComponent(GEOAPIFY_TEST_KEY)}`;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 8000);
   try {
@@ -179,7 +198,7 @@ async function planRoadRoute(points, includeSurfaces = false) {
     const steps = (feature.properties?.legs ?? []).flatMap((leg, index) =>
       (leg.steps ?? []).flatMap((step) => {
         const point = geometry.coordinates[index]?.[step.from_index];
-        return point && step.instruction?.text ? [{ point, text: step.instruction.text, meters: offsets[index][step.from_index] }] : [];
+        return point && step.instruction?.text ? [{ point, text: step.instruction.text, type: step.instruction.type, meters: offsets[index][step.from_index] }] : [];
       })
     );
     const unsealed = (feature.properties?.legs ?? []).flatMap((leg) => leg.steps ?? [])
@@ -200,7 +219,7 @@ async function buildDirections(here, remaining, plannedRoute) {
   const totalMeters = offsets.at(-1).at(-1);
   const end = lines.at(-1).at(-1);
   if (totalMeters - steps.at(-1).meters > 10) {
-    steps.push({ point: end, meters: totalMeters, text: 'Continue to your destination' });
+    steps.push({ point: end, meters: totalMeters, type: 'DestinationReached', text: 'Continue to your destination' });
   }
   return {
     lines, steps, remaining, offsets, totalMeters, seconds, progress: 0,
@@ -316,7 +335,6 @@ export default function App() {
   const currentPoint = useRef(null);
   const [searchNear, setSearchNear] = useState(null);
   const [navigation, setNavigation] = useState(null);
-  const [navPoint, setNavPoint] = useState(null);
   const navigationFix = useRef(null);
   const [rerouteStatus, setRerouteStatus] = useState(null);
 
@@ -339,7 +357,6 @@ export default function App() {
       if (previousFix && fix.timestamp - previousFix.timestamp > 10_000) offRouteFixes = 0;
       previousFix = fix;
       const { point, accuracy } = fix;
-      setNavPoint(point);
       if (remaining.length > 1 && distM(point, remaining[0]) <= 35) {
         remaining = remaining.slice(1);
       }
@@ -827,7 +844,6 @@ export default function App() {
       setSelectedRide(null);
       setRoutePreview(null);
       setLibraryView(null);
-      setNavPoint(here);
       setRerouteStatus(null);
       setNavigation(directions);
       setFollow(true);
@@ -1008,23 +1024,7 @@ export default function App() {
         )}
 
         {navigation && (
-          <View style={styles.banner}>
-            <Text style={styles.rowTitle}>{navigation.arrived ? 'Destination reached' : rerouteStatus ?? navigation.steps[navigation.index].text}</Text>
-            {!navigation.arrived && !rerouteStatus && navPoint && (
-              <Text style={styles.rowDetail}>{formatDistance(Math.max(0, navigation.steps[navigation.index].meters - navigation.progress))} to maneuver</Text>
-            )}
-            {!navigation.arrived && (
-              <Text style={styles.rowDetail}>
-                {formatDistance(navigation.totalMeters - navigation.progress)} left
-                {navigation.seconds > 0 && navigation.totalMeters > 0
-                  ? ` · ETA ${new Date(Date.now() + navigation.seconds * (1 - navigation.progress / navigation.totalMeters) * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`
-                  : ''}
-              </Text>
-            )}
-            <Pressable accessibilityRole="button" style={styles.retryButton} onPress={() => setNavigation(null)}>
-              <Text style={styles.retryText}>End directions</Text>
-            </Pressable>
-          </View>
+          <NavigationPanel navigation={navigation} rerouteStatus={rerouteStatus} onEnd={() => setNavigation(null)} />
         )}
         {mapFailed && (
           <View style={styles.banner}>
@@ -1278,6 +1278,45 @@ function PlaceSearch({ near, title, placeholder, selected, onSelect, onEdit, dis
   );
 }
 
+function NavigationPanel({ navigation, rerouteStatus, onEnd }) {
+  const step = navigation.steps[navigation.index];
+  const remaining = Math.max(0, navigation.totalMeters - navigation.progress);
+  const eta = navigation.seconds > 0 && navigation.totalMeters > 0
+    ? new Date(Date.now() + navigation.seconds * remaining / navigation.totalMeters * 1000)
+      .toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+    : null;
+  const status = navigation.arrived ? 'Destination reached' : rerouteStatus;
+  const distance = formatTurnDistance(step.meters - navigation.progress);
+  return (
+    <View style={styles.navigationPanel}>
+      <View style={styles.navigationMain} accessible accessibilityLabel={status || `${distance}, ${step.text}`}>
+        <Text style={styles.maneuverArrow}>
+          {navigation.arrived ? '⚑' : rerouteStatus ? '↻' : maneuverArrow(step.type)}
+        </Text>
+        <View style={styles.maneuverDetails}>
+          {status ? <Text style={styles.maneuverStatus}>{status}</Text> : (
+            <>
+              <Text style={styles.maneuverDistance}>{distance}</Text>
+              <Text style={styles.maneuverInstruction} numberOfLines={3}>{step.text}</Text>
+            </>
+          )}
+        </View>
+      </View>
+      <View style={styles.navigationFooter}>
+        {!navigation.arrived && (
+          <Text style={styles.navigationRemaining}>
+            {formatTurnDistance(remaining)} left{eta ? ` · ETA ${eta}` : ''}
+          </Text>
+        )}
+        <Pressable accessibilityRole="button" accessibilityLabel="End directions"
+          style={styles.endDirections} onPress={onEnd}>
+          <Text style={styles.endDirectionsText}>End</Text>
+        </Pressable>
+      </View>
+    </View>
+  );
+}
+
 function RoundBtn({ label, onPress, active }) {
   return (
     <Pressable onPress={onPress} style={[styles.round, active && { borderColor: PINK }]}>
@@ -1361,6 +1400,17 @@ const styles = StyleSheet.create({
   libraryTitle: { color: '#fff', fontSize: 25, fontWeight: '700' },
   libraryList: { padding: 16, gap: 10 },
   libraryRow: { padding: 16, borderRadius: 14, backgroundColor: PANEL, gap: 5 },
+  navigationPanel: { margin: 12, paddingHorizontal: 16, paddingTop: 12, backgroundColor: '#141416', borderRadius: 20 },
+  navigationMain: { flexDirection: 'row', alignItems: 'center', gap: 14 },
+  maneuverArrow: { color: '#fff', fontSize: 62, lineHeight: 72, fontWeight: '700', minWidth: 66, textAlign: 'center' },
+  maneuverDetails: { flex: 1 },
+  maneuverDistance: { color: '#fff', fontSize: 44, fontWeight: '800', fontVariant: ['tabular-nums'] },
+  maneuverInstruction: { color: '#f4f4f6', fontSize: 19, fontWeight: '600' },
+  maneuverStatus: { color: '#fff', fontSize: 23, fontWeight: '700' },
+  navigationFooter: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 8 },
+  navigationRemaining: { color: '#d2d2d8', fontSize: 15, flex: 1 },
+  endDirections: { minWidth: 50, minHeight: 48, justifyContent: 'center', alignItems: 'center', marginLeft: 'auto' },
+  endDirectionsText: { color: '#FF80BE', fontSize: 16, fontWeight: '700' },
   rowTitle: { color: '#fff', fontSize: 17, fontWeight: '600' },
   placeInput: { color: '#fff', fontSize: 16, paddingVertical: 10 },
   placeResult: { paddingVertical: 12, borderTopWidth: StyleSheet.hairlineWidth, borderColor: '#52525a' },
