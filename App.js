@@ -110,6 +110,9 @@ export default function App() {
   const [libraryView, setLibraryView] = useState(null);
   const [follow, setFollow] = useState(true);
   const [permission, setPermission] = useState(null);
+  const [locationFailed, setLocationFailed] = useState(false);
+  const [mapFailed, setMapFailed] = useState(false);
+  const [mapAttempt, setMapAttempt] = useState(0);
 
   // ride state
   const [riding, setRiding] = useState(false);
@@ -205,15 +208,19 @@ export default function App() {
     let sub;
     let active = true;
     (async () => {
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      if (!active) return;
-      setPermission(status);
-      if (status !== 'granted') return;
-      sub = await Location.watchPositionAsync(
-        { accuracy: Location.Accuracy.BestForNavigation, distanceInterval: 5, timeInterval: 1000 },
-        onLocation
-      );
-      if (!active) sub.remove();
+      try {
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (!active) return;
+        setPermission(status);
+        if (status !== 'granted') return;
+        sub = await Location.watchPositionAsync(
+          { accuracy: Location.Accuracy.BestForNavigation, distanceInterval: 5, timeInterval: 1000 },
+          onLocation
+        );
+        if (!active) sub.remove();
+      } catch {
+        if (active) setLocationFailed(true);
+      }
     })();
     return () => {
       active = false;
@@ -241,6 +248,10 @@ export default function App() {
 
   const startRide = () => {
     if (ridingRef.current || finishingRideRef.current) return;
+    if (locationFailed) {
+      Alert.alert('GPS unavailable', 'Check that Location Services are enabled, then reopen RouteRunner.');
+      return;
+    }
     if (permission !== 'granted') {
       Alert.alert('Location needed', 'Allow location access to start recording a ride.');
       return;
@@ -343,6 +354,9 @@ export default function App() {
     <View style={styles.root}>
       <StatusBar style="light" />
       <MapLibreGL.MapView
+        key={mapAttempt}
+        onDidFailLoadingMap={() => setMapFailed(true)}
+        onDidFinishLoadingMap={() => setMapFailed(false)}
         style={StyleSheet.absoluteFill}
         mapStyle={MAP_STYLE}
         logoEnabled={false}
@@ -418,6 +432,24 @@ export default function App() {
           <View style={{ flex: 1 }} />
           <RoundBtn label="Saved routes" onPress={() => setLibraryView('routes')} />
         </View>
+
+        {mapFailed && (
+          <View style={styles.banner}>
+            <Text style={styles.bannerText}>Map could not load. Check your connection and try again.</Text>
+            <Pressable accessibilityRole="button" style={styles.retryButton} onPress={() => {
+              setMapFailed(false);
+              setMapAttempt((attempt) => attempt + 1);
+            }}>
+              <Text style={styles.retryText}>Reload map</Text>
+            </Pressable>
+          </View>
+        )}
+
+        {locationFailed && (
+          <View style={styles.banner}>
+            <Text style={styles.bannerText}>GPS unavailable. Check Location Services and reopen the app.</Text>
+          </View>
+        )}
 
         {permission === 'denied' && (
           <View style={styles.banner}>
@@ -574,6 +606,8 @@ const styles = StyleSheet.create({
   statLabel: { color: '#9a9aa0', fontSize: 12, marginTop: 2 },
   banner: { margin: 16, padding: 12, borderRadius: 12, backgroundColor: PANEL },
   bannerText: { color: '#fff', fontSize: 14 },
+  retryButton: { alignSelf: 'flex-start', paddingVertical: 10 },
+  retryText: { color: '#FF80BE', fontWeight: '700' },
   libraryHeader: {
     flexDirection: 'row',
     alignItems: 'center',
