@@ -1,9 +1,8 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { View, Text, Pressable, StyleSheet, Alert, SafeAreaView, Modal, ScrollView, Platform, TextInput } from 'react-native';
+import { View, Text, Pressable, StyleSheet, Alert, SafeAreaView, Modal, ScrollView, Platform, TextInput, NativeModules } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
-import { getLocales } from 'expo-localization';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import MapLibreGL from '@maplibre/maplibre-react-native';
 
@@ -72,7 +71,10 @@ const fmtTime = (s) => {
   const m = Math.floor(s / 60);
   return `${m}:${String(s % 60).padStart(2, '0')}`;
 };
-const region = getLocales()[0]?.regionCode;
+const settings = NativeModules.SettingsManager?.settings;
+const locale = settings?.AppleLocale ?? settings?.AppleLanguages?.[0] ??
+  Intl.DateTimeFormat().resolvedOptions().locale;
+const region = locale.split(/[-_@]/).slice(1).find((part) => /^[A-Z]{2}$/.test(part));
 const useMiles = region === 'US' || region === 'GB';
 const distanceUnit = useMiles ? 'mi' : 'km';
 const speedUnit = useMiles ? 'mph' : 'km/h';
