@@ -19,6 +19,8 @@
       "expo-dev-client",
       "@maplibre/maplibre-react-native",
       ["expo-location", {
+        "isIosBackgroundLocationEnabled": true,
+        "locationAlwaysAndWhenInUsePermission": "RouteRunner records your GPS path during a ride you start, even while your screen is locked.",
         "locationWhenInUsePermission": "Unlock Map uses your location to show you on the map and reveal the roads you ride."
       }]
     ]
