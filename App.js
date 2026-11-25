@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { View, Text, Pressable, StyleSheet, Alert, SafeAreaView } from 'react-native';
+import { View, Text, Pressable, StyleSheet, Alert, SafeAreaView, Modal, ScrollView } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import * as Location from 'expo-location';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -106,12 +106,16 @@ export default function App() {
 
   const [trail, setTrail] = useState([]);
   const [routes, setRoutes] = useState([]);
+  const [rides, setRides] = useState([]);
+  const [libraryView, setLibraryView] = useState(null);
   const [follow, setFollow] = useState(true);
   const [permission, setPermission] = useState(null);
 
   // ride state
   const [riding, setRiding] = useState(false);
   const ridingRef = useRef(false);
+  const rideStartedAt = useRef(0);
+  const finishingRideRef = useRef(false);
   const [stats, setStats] = useState({ seconds: 0, meters: 0, speed: 0, top: 0 });
   const statsRef = useRef({ seconds: 0, meters: 0, speed: 0, top: 0 });
   const rideLineRef = useRef([]);
@@ -121,6 +125,12 @@ export default function App() {
   const [draft, setDraft] = useState([]);
   const [savingRoute, setSavingRoute] = useState(false);
   const savingRouteRef = useRef(false);
+
+  useEffect(() => {
+    AsyncStorage.getItem(RIDES_KEY).then((saved) => {
+      if (saved) setRides(JSON.parse(saved));
+    }).catch(() => {});
+  }, []);
 
   // load saved data
   useEffect(() => {
@@ -215,7 +225,7 @@ export default function App() {
   useEffect(() => {
     if (!riding) return;
     const id = setInterval(() => {
-      statsRef.current.seconds += 1;
+      statsRef.current.seconds = Math.floor((Date.now() - rideStartedAt.current) / 1000);
       setStats({ ...statsRef.current });
     }, 1000);
     return () => clearInterval(id);
@@ -230,6 +240,12 @@ export default function App() {
   }, [riding, flushSamples]);
 
   const startRide = () => {
+    if (ridingRef.current || finishingRideRef.current) return;
+    if (permission !== 'granted') {
+      Alert.alert('Location needed', 'Allow location access to start recording a ride.');
+      return;
+    }
+    rideStartedAt.current = Date.now();
     statsRef.current = { seconds: 0, meters: 0, speed: 0, top: 0 };
     rideLineRef.current = [];
     lastPtRef.current = null;
@@ -240,21 +256,33 @@ export default function App() {
   };
 
   const endRide = async () => {
+    if (!ridingRef.current) return;
     ridingRef.current = false;
+    finishingRideRef.current = true;
     setRiding(false);
     flushSamples();
-    const s = statsRef.current;
-    const summary = { date: Date.now(), ...s, line: rideLineRef.current };
+    const date = Date.now();
+    const summary = {
+      ...statsRef.current,
+      date,
+      seconds: Math.floor((date - rideStartedAt.current) / 1000),
+      line: rideLineRef.current,
+    };
     try {
       const raw = await AsyncStorage.getItem(RIDES_KEY);
       const all = raw ? JSON.parse(raw) : [];
-      all.push(summary);
-      await AsyncStorage.setItem(RIDES_KEY, JSON.stringify(all));
-    } catch (e) {}
-    Alert.alert(
-      'Ride complete',
-      `Time ${fmtTime(s.seconds)}\nDistance ${(s.meters / 1000).toFixed(2)} km\nTop speed ${kmh(s.top)} km/h`
-    );
+      const next = [summary, ...all];
+      await AsyncStorage.setItem(RIDES_KEY, JSON.stringify(next));
+      setRides(next);
+      Alert.alert(
+        'Ride saved',
+        `Time ${fmtTime(summary.seconds)}\nDistance ${(summary.meters / 1000).toFixed(2)} km\nTop speed ${kmh(summary.top)} km/h`
+      );
+    } catch {
+      Alert.alert('Ride could not be saved', 'There was a problem writing to device storage.');
+    } finally {
+      finishingRideRef.current = false;
+    }
   };
 
   const onMapPress = (event) => {
@@ -290,7 +318,21 @@ export default function App() {
     }
   };
 
-  const soon = (name) => Alert.alert(name, 'Coming in a later phase.');
+  const showRoute = (route) => {
+    const points = (route.lines ?? [route.line]).flat();
+    if (!points.length) return;
+    const bounds = points.reduce((box, [lon, lat]) => ({
+      west: Math.min(box.west, lon),
+      south: Math.min(box.south, lat),
+      east: Math.max(box.east, lon),
+      north: Math.max(box.north, lat),
+    }), { west: Infinity, south: Infinity, east: -Infinity, north: -Infinity });
+    setFollow(false);
+    setLibraryView(null);
+    requestAnimationFrame(() => {
+      cameraRef.current?.fitBounds([bounds.east, bounds.north], [bounds.west, bounds.south], 70, 450);
+    });
+  };
 
   const pinkLayerStyle = {
     glow: { lineColor: PINK, lineWidth: 10, lineBlur: 8, lineOpacity: 0.7, lineCap: 'round', lineJoin: 'round' },
@@ -372,9 +414,9 @@ export default function App() {
       {/* Top row */}
       <SafeAreaView pointerEvents="box-none" style={StyleSheet.absoluteFill}>
         <View style={styles.topRow} pointerEvents="box-none">
-          <RoundBtn label="Profile" onPress={() => soon('Profile')} />
+          <RoundBtn label="History" onPress={() => setLibraryView('rides')} />
           <View style={{ flex: 1 }} />
-          <RoundBtn label="Friends" onPress={() => soon('Friends')} />
+          <RoundBtn label="Saved routes" onPress={() => setLibraryView('routes')} />
         </View>
 
         {permission === 'denied' && (
@@ -402,7 +444,7 @@ export default function App() {
 
         <View style={{ flex: 1 }} pointerEvents="none" />
 
-        {GEOAPIFY_TEST_KEY && (
+        {GEOAPIFY_TEST_KEY && !drawing && (
           <Text style={styles.hint}>
             Road unlocking sends ride GPS points to Geoapify.
           </Text>
@@ -432,6 +474,33 @@ export default function App() {
           <Text style={styles.hint}>{draft.length ? `${draft.length}/12 waypoints` : 'Tap the map to add at least two waypoints'}</Text>
         )}
       </SafeAreaView>
+      <Modal visible={libraryView !== null} animationType="slide" onRequestClose={() => setLibraryView(null)}>
+        <SafeAreaView style={styles.root}>
+          <View style={styles.libraryHeader}>
+            <Text style={styles.libraryTitle}>{libraryView === 'routes' ? 'Saved routes' : 'Ride history'}</Text>
+            <RoundBtn label="Close" onPress={() => setLibraryView(null)} />
+          </View>
+          <ScrollView contentContainerStyle={styles.libraryList}>
+            {libraryView === 'routes' ? (
+              routes.length ? routes.map((route) => (
+                <Pressable accessibilityRole="button" key={route.id} style={styles.libraryRow} onPress={() => showRoute(route)}>
+                  <Text style={styles.rowTitle}>{route.name}</Text>
+                  <Text style={styles.rowDetail}>Show on map</Text>
+                </Pressable>
+              )) : <Text style={styles.rowDetail}>No saved routes yet. Use Route on the map to plan one.</Text>
+            ) : (
+              rides.length ? [...rides].sort((a, b) => b.date - a.date).map((ride, index) => (
+                <View key={`${ride.date}-${index}`} style={styles.libraryRow}>
+                  <Text style={styles.rowTitle}>{new Date(ride.date).toLocaleString()}</Text>
+                  <Text style={styles.rowDetail}>
+                    {`${(ride.meters / 1000).toFixed(2)} km · ${fmtTime(ride.seconds)} · Top ${kmh(ride.top)} km/h`}
+                  </Text>
+                </View>
+              )) : <Text style={styles.rowDetail}>No rides yet. Start a ride from the map.</Text>
+            )}
+          </ScrollView>
+        </SafeAreaView>
+      </Modal>
     </View>
   );
 }
@@ -505,6 +574,17 @@ const styles = StyleSheet.create({
   statLabel: { color: '#9a9aa0', fontSize: 12, marginTop: 2 },
   banner: { margin: 16, padding: 12, borderRadius: 12, backgroundColor: PANEL },
   bannerText: { color: '#fff', fontSize: 14 },
+  libraryHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: 16,
+  },
+  libraryTitle: { color: '#fff', fontSize: 25, fontWeight: '700' },
+  libraryList: { padding: 16, gap: 10 },
+  libraryRow: { padding: 16, borderRadius: 14, backgroundColor: PANEL, gap: 5 },
+  rowTitle: { color: '#fff', fontSize: 17, fontWeight: '600' },
+  rowDetail: { color: '#b9b9c0', fontSize: 14 },
   hint: {
     position: 'absolute',
     bottom: 96,
