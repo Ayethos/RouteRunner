@@ -74,6 +74,26 @@ async function matchRoads(samples) {
   }
 }
 
+async function planRoadRoute(points) {
+  // The Routing API takes latitude first. The response uses GeoJSON order.
+  const waypoints = points.map(([lon, lat]) => `${lat},${lon}`).join('|');
+  const query = `waypoints=${encodeURIComponent(waypoints)}&mode=drive&format=geojson&apiKey=${encodeURIComponent(GEOAPIFY_TEST_KEY)}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+  try {
+    const response = await fetch(`https://api.geoapify.com/v1/routing?${query}`, {
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error('Route request failed');
+    const result = await response.json();
+    const geometry = result.features?.[0]?.geometry;
+    if (geometry?.type !== 'MultiLineString') return [];
+    return geometry.coordinates.filter((line) => line.length > 1);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 // ---- App -----------------------------------------------------------------
 export default function App() {
   const cameraRef = useRef(null);
@@ -99,6 +119,8 @@ export default function App() {
   // route drawing
   const [drawing, setDrawing] = useState(false);
   const [draft, setDraft] = useState([]);
+  const [savingRoute, setSavingRoute] = useState(false);
+  const savingRouteRef = useRef(false);
 
   // load saved data
   useEffect(() => {
@@ -210,6 +232,7 @@ export default function App() {
   const startRide = () => {
     statsRef.current = { seconds: 0, meters: 0, speed: 0, top: 0 };
     rideLineRef.current = [];
+    lastPtRef.current = null;
     setStats({ ...statsRef.current });
     ridingRef.current = true;
     setRiding(true);
@@ -234,18 +257,37 @@ export default function App() {
     );
   };
 
-  const onMapPress = (e) => {
-    if (!drawing) return;
-    setDraft((d) => [...d, e.geometry.coordinates]);
+  const onMapPress = (event) => {
+    if (!drawing || savingRouteRef.current) return;
+    const point = event.geometry.coordinates;
+    setDraft((points) => points.length < 12 ? [...points, point] : points);
   };
 
   const saveRoute = async () => {
-    if (draft.length < 2) return;
-    const next = [...routes, { id: String(Date.now()), name: `Route ${routes.length + 1}`, line: draft }];
-    setRoutes(next);
-    setDraft([]);
-    setDrawing(false);
-    AsyncStorage.setItem(ROUTES_KEY, JSON.stringify(next)).catch(() => {});
+    if (draft.length < 2 || savingRouteRef.current) return;
+    if (!GEOAPIFY_TEST_KEY) {
+      Alert.alert('Route planning unavailable', 'This build needs a Geoapify key.');
+      return;
+    }
+    savingRouteRef.current = true;
+    setSavingRoute(true);
+    try {
+      const lines = await planRoadRoute(draft);
+      if (!lines.length) {
+        Alert.alert('No driving route found', 'Move a waypoint closer to a road and try again.');
+        return;
+      }
+      const next = [...routes, { id: String(Date.now()), name: `Route ${routes.length + 1}`, lines }];
+      await AsyncStorage.setItem(ROUTES_KEY, JSON.stringify(next));
+      setRoutes(next);
+      setDraft([]);
+      setDrawing(false);
+    } catch {
+      Alert.alert('Could not save route', 'Your waypoints are still on the map. Try again.');
+    } finally {
+      savingRouteRef.current = false;
+      setSavingRoute(false);
+    }
   };
 
   const soon = (name) => Alert.alert(name, 'Coming in a later phase.');
@@ -303,15 +345,27 @@ export default function App() {
         </MapLibreGL.ShapeSource>
 
         {/* Saved routes: neon pink */}
-        <MapLibreGL.ShapeSource id="routes" shape={fc(routes.map((r) => r.line))}>
+        <MapLibreGL.ShapeSource id="routes" shape={fc(routes.flatMap((route) => route.lines ?? [route.line]))}>
           <MapLibreGL.LineLayer id="routes-glow" style={pinkLayerStyle.glow} />
           <MapLibreGL.LineLayer id="routes-core" style={pinkLayerStyle.core} />
         </MapLibreGL.ShapeSource>
 
         {/* Route being drawn */}
         <MapLibreGL.ShapeSource id="draft" shape={fc([draft])}>
-          <MapLibreGL.LineLayer id="draft-glow" style={pinkLayerStyle.glow} />
-          <MapLibreGL.LineLayer id="draft-core" style={pinkLayerStyle.core} />
+          <MapLibreGL.LineLayer id="draft-core" style={{ ...pinkLayerStyle.core, lineDasharray: [2, 2] }} />
+        </MapLibreGL.ShapeSource>
+        <MapLibreGL.ShapeSource
+          id="draft-waypoints"
+          shape={{
+            type: 'FeatureCollection',
+            features: draft.map((point) => ({
+              type: 'Feature',
+              properties: {},
+              geometry: { type: 'Point', coordinates: point },
+            })),
+          }}
+        >
+          <MapLibreGL.CircleLayer id="draft-pins" style={{ circleColor: PINK, circleRadius: 5, circleStrokeColor: '#fff', circleStrokeWidth: 1.5 }} />
         </MapLibreGL.ShapeSource>
       </MapLibreGL.MapView>
 
@@ -358,9 +412,9 @@ export default function App() {
         <View style={styles.bottomRow} pointerEvents="box-none">
           {drawing ? (
             <>
-              <Pill label="Cancel" onPress={() => { setDrawing(false); setDraft([]); }} />
-              <Pill label="Undo" onPress={() => setDraft((d) => d.slice(0, -1))} />
-              <Pill label="Save route" primary onPress={saveRoute} />
+              <Pill label="Cancel" disabled={savingRoute} onPress={() => { setDrawing(false); setDraft([]); }} />
+              <Pill label="Undo" disabled={savingRoute || !draft.length} onPress={() => setDraft((d) => d.slice(0, -1))} />
+              <Pill label={savingRoute ? "Finding roads…" : "Save route"} primary disabled={savingRoute || draft.length < 2} onPress={saveRoute} />
             </>
           ) : (
             <>
@@ -375,7 +429,7 @@ export default function App() {
           )}
         </View>
         {drawing && (
-          <Text style={styles.hint}>Tap the map to add points to your route</Text>
+          <Text style={styles.hint}>{draft.length ? `${draft.length}/12 waypoints` : 'Tap the map to add at least two waypoints'}</Text>
         )}
       </SafeAreaView>
     </View>
@@ -389,9 +443,9 @@ function RoundBtn({ label, onPress, active }) {
     </Pressable>
   );
 }
-function Pill({ label, onPress, primary }) {
+function Pill({ label, onPress, primary, disabled = false }) {
   return (
-    <Pressable onPress={onPress} style={[styles.pill, primary && styles.pillPrimary]}>
+    <Pressable disabled={disabled} onPress={onPress} style={[styles.pill, primary && styles.pillPrimary, disabled && { opacity: 0.5 }]}>
       <Text style={[styles.pillText, primary && { color: '#fff' }]}>{label}</Text>
     </Pressable>
   );
