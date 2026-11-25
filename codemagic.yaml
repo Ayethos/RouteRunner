@@ -77,3 +77,16 @@ workflows:
           echo "$CERTIFICATE_KEY_B64" | base64 --decode > $HOME/cert_key.pem
           keychain initialize
           app-store-connect fetch-signing-files "$BUNDLE_ID" --type IOS_APP_STORE --create --certificate-key "@file:$HOME/cert_key.pem"
+          keychain add-certificates
+          xcode-project use-profiles --project "$(ls -d ios/*.xcodeproj | head -1)"
+      - name: Build signed IPA
+        script: |
+          WORKSPACE=$(ls -d ios/*.xcworkspace | head -1)
+          SCHEME=$(basename "$WORKSPACE" .xcworkspace)
+          xcode-project build-ipa --workspace "$WORKSPACE" --scheme "$SCHEME"
+    artifacts:
+      - build/ios/ipa/*.ipa
+    publishing:
+      app_store_connect:
+        auth: integration
+        submit_to_testflight: true
