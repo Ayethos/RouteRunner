@@ -29,7 +29,7 @@ const MAP_STYLE = {
 
 const TRAIL_KEY = 'trail:matched:v1';
 const MATCH_INTERVAL_MS = 30_000;
-const MATCH_URL = process.env.EXPO_PUBLIC_OSRM_URL?.replace(/\/+$/, '');
+const GEOAPIFY_TEST_KEY = process.env.EXPO_PUBLIC_GEOAPIFY_TEST_KEY?.trim();
 const ROUTES_KEY = 'routes:v1';
 const RIDES_KEY = 'rides:v1';
 
@@ -57,23 +57,33 @@ const fmtTime = (s) => {
 const kmh = (ms) => Math.max(0, Math.round((ms || 0) * 3.6));
 
 async function matchRoads(samples) {
-  const coordinates = samples.map(({ point }) => point.join(',')).join(';');
-  const timestamps = samples.map(({ seconds }) => seconds).join(';');
-  const radiuses = samples.map(({ accuracy }) => accuracy).join(';');
-  const query = `geometries=geojson&overview=full&timestamps=${timestamps}&radiuses=${radiuses}`;
+  const waypoints = samples.map(({ point, seconds }) => ({
+    location: point,
+    timestamp: new Date(seconds * 1000).toISOString(),
+  }));
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 8000);
   try {
-    const response = await fetch(`${MATCH_URL}/match/v1/driving/${coordinates}?${query}`, {
+    const url = `https://api.geoapify.com/v1/mapmatching?apiKey=${encodeURIComponent(GEOAPIFY_TEST_KEY)}`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'drive', waypoints }),
       signal: controller.signal,
     });
     if (!response.ok) throw new Error('Road matching request failed');
     const result = await response.json();
-    if (result.code !== 'Ok') return [];
-    return (result.matchings ?? [])
-      .filter(({ confidence, geometry }) =>
-        confidence >= 0.7 && geometry?.type === 'LineString' && geometry.coordinates.length > 1)
-      .map(({ geometry }) => geometry.coordinates);
+    return (result.features ?? []).flatMap(({ geometry, properties }) => {
+      const matched = (properties?.waypoints ?? []).filter(({ match_type, match_distance }) =>
+        match_type === 'matched' && Number.isFinite(match_distance) && match_distance <= 35
+      );
+      if (matched.length < 2 || geometry?.type !== 'MultiLineString') return [];
+      return geometry.coordinates.filter((line) =>
+        line.length > 1 && line.every(([lon, lat]) =>
+          Number.isFinite(lon) && Math.abs(lon) <= 180 &&
+          Number.isFinite(lat) && Math.abs(lat) <= 90)
+      );
+    });
   } finally {
     clearTimeout(timeout);
   }
@@ -124,7 +134,7 @@ export default function App() {
   const flushSamples = useCallback((keepLast = false) => {
     const samples = pendingSamples.current;
     pendingSamples.current = keepLast ? samples.slice(-1) : [];
-    if (!MATCH_URL || samples.length < 2) return;
+    if (!GEOAPIFY_TEST_KEY || samples.length < 2) return;
 
     matchQueue.current = matchQueue.current.then(async () => {
       try {
@@ -146,12 +156,12 @@ export default function App() {
       const { longitude, latitude, accuracy } = loc.coords;
       const pt = [longitude, latitude];
       const prev = lastPtRef.current;
-      if (ridingRef.current && MATCH_URL && accuracy > 0 && accuracy <= 30) {
+      if (ridingRef.current && GEOAPIFY_TEST_KEY && accuracy > 0 && accuracy <= 30) {
         const seconds = Math.floor(loc.timestamp / 1000);
         const previousSample = pendingSamples.current.at(-1);
         if (!previousSample ||
             (seconds - previousSample.seconds >= 2 && distM(previousSample.point, pt) >= 10)) {
-          pendingSamples.current.push({ point: pt, seconds, accuracy: Math.max(5, Math.round(accuracy)) });
+          pendingSamples.current.push({ point: pt, seconds });
         }
       }
 
@@ -205,7 +215,7 @@ export default function App() {
   }, [riding]);
 
   useEffect(() => {
-    if (!riding || !MATCH_URL) return;
+    if (!riding || !GEOAPIFY_TEST_KEY) return;
     const timer = setInterval(() => {
       if (ridingRef.current) flushSamples(true);
     }, MATCH_INTERVAL_MS);
@@ -334,10 +344,10 @@ export default function App() {
           </View>
         )}
 
-        {permission === 'granted' && (!MATCH_URL || matchingFailed) && (
+        {permission === 'granted' && (!GEOAPIFY_TEST_KEY || matchingFailed) && (
           <View style={styles.banner}>
             <Text style={styles.bannerText}>
-              {MATCH_URL ? 'Road matching is temporarily unavailable.' : 'Road matching is unavailable in this build.'}
+              {GEOAPIFY_TEST_KEY ? 'Road matching is temporarily unavailable.' : 'Road matching is unavailable in this build.'}
             </Text>
           </View>
         )}
@@ -352,6 +362,12 @@ export default function App() {
         )}
 
         <View style={{ flex: 1 }} pointerEvents="none" />
+
+        {GEOAPIFY_TEST_KEY && (
+          <Text style={styles.hint}>
+            Road unlocking sends ride GPS points to Geoapify.
+          </Text>
+        )}
 
         {/* Bottom controls */}
         <View style={styles.bottomRow} pointerEvents="box-none">
