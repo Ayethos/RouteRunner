@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { View, Text, Pressable, StyleSheet, Alert, SafeAreaView, Modal, ScrollView, Platform } from 'react-native';
+import { View, Text, Pressable, StyleSheet, Alert, SafeAreaView, Modal, ScrollView, Platform, TextInput } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
@@ -169,6 +169,13 @@ export default function App() {
   // route drawing
   const [drawing, setDrawing] = useState(false);
   const [draft, setDraft] = useState([]);
+  const [addressPlanner, setAddressPlanner] = useState(false);
+  const [origin, setOrigin] = useState(null);
+  const [originReset, setOriginReset] = useState(0);
+  const [originNeedsSelection, setOriginNeedsSelection] = useState(false);
+  const [destination, setDestination] = useState(null);
+  const [routePreview, setRoutePreview] = useState(null);
+  const currentPoint = useRef(null);
   const [savingRoute, setSavingRoute] = useState(false);
   const savingRouteRef = useRef(false);
 
@@ -270,7 +277,10 @@ export default function App() {
         if (status !== 'granted') return;
         sub = await Location.watchPositionAsync(
           { accuracy: Location.Accuracy.BestForNavigation, distanceInterval: 5, timeInterval: 1000 },
-          (location) => { if (!backgroundRideRef.current) onLocation(location); }
+          (location) => {
+            currentPoint.current = [location.coords.longitude, location.coords.latitude];
+            if (!backgroundRideRef.current) onLocation(location);
+          }
         );
         if (!active) sub.remove();
       } catch {
@@ -425,6 +435,54 @@ export default function App() {
     setDraft((points) => points.length < 12 ? [...points, point] : points);
   };
 
+  const previewAddressRoute = async () => {
+    if (savingRouteRef.current || !destination || originNeedsSelection) return;
+    if (!GEOAPIFY_TEST_KEY) {
+      Alert.alert('Route planning unavailable', 'This build needs a Geoapify key.');
+      return;
+    }
+    const start = origin?.point ?? currentPoint.current;
+    if (!start) {
+      Alert.alert('Current location unavailable', 'Wait for a GPS fix or search for a starting point.');
+      return;
+    }
+    savingRouteRef.current = true;
+    setSavingRoute(true);
+    try {
+      const lines = await planRoadRoute([start, destination.point]);
+      if (!lines.length) {
+        Alert.alert('No driving route found', 'Try a different start or destination.');
+        return;
+      }
+      setRoutePreview({ name: destination.label, lines });
+      setSelectedRide(null);
+      setAddressPlanner(false);
+      showOnMap(lines);
+    } catch {
+      Alert.alert('Could not find route', 'Try again when your connection is available.');
+    } finally {
+      savingRouteRef.current = false;
+      setSavingRoute(false);
+    }
+  };
+
+  const saveAddressRoute = async () => {
+    if (!routePreview || savingRouteRef.current) return;
+    savingRouteRef.current = true;
+    setSavingRoute(true);
+    try {
+      const next = [...routes, { id: String(Date.now()), ...routePreview }];
+      await AsyncStorage.setItem(ROUTES_KEY, JSON.stringify(next));
+      setRoutes(next);
+      setRoutePreview(null);
+    } catch {
+      Alert.alert('Could not save route', 'Try saving again.');
+    } finally {
+      savingRouteRef.current = false;
+      setSavingRoute(false);
+    }
+  };
+
   const saveRoute = async () => {
     if (draft.length < 2 || savingRouteRef.current) return;
     if (!GEOAPIFY_TEST_KEY) {
@@ -547,6 +605,12 @@ export default function App() {
           </MapLibreGL.ShapeSource>
         )}
 
+        {routePreview && (
+          <MapLibreGL.ShapeSource id="address-preview" shape={fc(routePreview.lines)}>
+            <MapLibreGL.LineLayer id="address-preview-core" style={pinkLayerStyle.core} />
+          </MapLibreGL.ShapeSource>
+        )}
+
         {/* Route being drawn */}
         <MapLibreGL.ShapeSource id="draft" shape={fc([draft])}>
           <MapLibreGL.LineLayer id="draft-core" style={{ ...pinkLayerStyle.core, lineDasharray: [2, 2] }} />
@@ -642,7 +706,13 @@ export default function App() {
 
         {/* Bottom controls */}
         <View style={styles.bottomRow} pointerEvents="box-none">
-          {drawing ? (
+          {routePreview ? (
+            <>
+              <Pill label="Edit" disabled={savingRoute} onPress={() => setAddressPlanner(true)} />
+              <Pill label="Close" disabled={savingRoute} onPress={() => setRoutePreview(null)} />
+              <Pill label="Save route" primary disabled={savingRoute} onPress={saveAddressRoute} />
+            </>
+          ) : drawing ? (
             <>
               <Pill label="Cancel" disabled={savingRoute} onPress={() => { setDrawing(false); setDraft([]); }} />
               <Pill label="Undo" disabled={savingRoute || !draft.length} onPress={() => setDraft((d) => d.slice(0, -1))} />
@@ -650,7 +720,7 @@ export default function App() {
             </>
           ) : (
             <>
-              <RoundBtn label="Route" onPress={() => { setDrawing(true); setFollow(false); }} />
+              <RoundBtn label="Route" onPress={() => setAddressPlanner(true)} />
               <Pill label={riding ? 'End ride' : 'Start ride'} primary onPress={riding ? endRide : startRide} />
               <RoundBtn
                 label="Locate"
@@ -664,6 +734,32 @@ export default function App() {
           <Text style={styles.hint}>{draft.length ? `${draft.length}/12 waypoints` : 'Tap the map to add at least two waypoints'}</Text>
         )}
       </SafeAreaView>
+      <Modal visible={addressPlanner} animationType="slide" onRequestClose={() => {
+        if (!savingRoute) setAddressPlanner(false);
+      }}>
+        <SafeAreaView style={styles.root}>
+          <View style={styles.libraryHeader}>
+            <Text style={styles.libraryTitle}>Plan a route</Text>
+            <Pill label="Close" disabled={savingRoute} onPress={() => setAddressPlanner(false)} />
+          </View>
+          <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.libraryList}>
+            <PlaceSearch key={originReset} title="From" placeholder="Current location" selected={origin}
+              onSelect={(place) => { setOrigin(place); setOriginNeedsSelection(false); }}
+              onEdit={(value) => setOriginNeedsSelection(Boolean(value.trim()))} disabled={savingRoute} />
+            {(origin || originNeedsSelection) && <Pill label="Use current location" disabled={savingRoute} onPress={() => { setOrigin(null); setOriginNeedsSelection(false); setOriginReset((value) => value + 1); }} />}
+            <PlaceSearch title="To" placeholder="Search address or place" selected={destination}
+              onSelect={setDestination} disabled={savingRoute} />
+            <Pill label={savingRoute ? "Finding roads…" : "Show route"} primary
+              disabled={!destination || originNeedsSelection || savingRoute} onPress={previewAddressRoute} />
+            <Pill label="Pick points on map" disabled={savingRoute} onPress={() => {
+              setAddressPlanner(false);
+              setRoutePreview(null);
+              setDrawing(true);
+              setFollow(false);
+            }} />
+          </ScrollView>
+        </SafeAreaView>
+      </Modal>
       <Modal visible={libraryView !== null} animationType="slide" onRequestClose={() => setLibraryView(null)}>
         <SafeAreaView style={styles.root}>
           <View style={styles.libraryHeader}>
@@ -695,6 +791,73 @@ export default function App() {
           </ScrollView>
         </SafeAreaView>
       </Modal>
+    </View>
+  );
+}
+
+async function searchPlaces(query, signal) {
+  const params = `text=${encodeURIComponent(query)}&format=json&limit=5&apiKey=${encodeURIComponent(GEOAPIFY_TEST_KEY)}`;
+  const response = await fetch(`https://api.geoapify.com/v1/geocode/autocomplete?${params}`, { signal });
+  if (!response.ok) throw new Error('Place search failed');
+  const result = await response.json();
+  return (result.results ?? [])
+    .filter(({ formatted, lon, lat }) => formatted && Number.isFinite(lon) && Number.isFinite(lat))
+    .map(({ formatted, lon, lat }) => ({ label: formatted, point: [lon, lat] }));
+}
+
+function PlaceSearch({ title, placeholder, selected, onSelect, onEdit, disabled }) {
+  const [query, setQuery] = useState(selected?.label ?? '');
+  const [results, setResults] = useState([]);
+  const [status, setStatus] = useState('');
+  useEffect(() => {
+    if (selected) {
+      setQuery(selected.label);
+      setResults([]);
+      setStatus('');
+      return;
+    }
+    if (query.trim().length < 3 || disabled) return;
+    if (!GEOAPIFY_TEST_KEY) {
+      setStatus('Place search needs a Geoapify key.');
+      return;
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(async () => {
+      setStatus('Searching…');
+      try {
+        const places = await searchPlaces(query.trim(), controller.signal);
+        if (controller.signal.aborted) return;
+        setResults(places);
+        setStatus(places.length ? '' : 'No places found.');
+      } catch {
+        if (!controller.signal.aborted) setStatus('Search failed. Try editing the address.');
+      }
+    }, 350);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [query, selected, disabled]);
+
+  return (
+    <View style={styles.libraryRow}>
+      <Text style={styles.rowTitle}>{title}</Text>
+      <TextInput accessibilityLabel={title} style={styles.placeInput} value={query}
+        placeholder={placeholder} placeholderTextColor="#aaa" editable={!disabled}
+        autoCorrect={false} onChangeText={(value) => {
+          if (selected) onSelect(null);
+          onEdit?.(value);
+          setQuery(value);
+          setResults([]);
+          setStatus('');
+        }} />
+      {status ? <Text style={styles.rowDetail}>{status}</Text> : null}
+      {results.map((place, index) => (
+        <Pressable accessibilityRole="button" key={`${place.label}-${index}`}
+          style={styles.placeResult} onPress={() => onSelect(place)}>
+          <Text style={styles.rowDetail}>{place.label}</Text>
+        </Pressable>
+      ))}
     </View>
   );
 }
@@ -780,6 +943,8 @@ const styles = StyleSheet.create({
   libraryList: { padding: 16, gap: 10 },
   libraryRow: { padding: 16, borderRadius: 14, backgroundColor: PANEL, gap: 5 },
   rowTitle: { color: '#fff', fontSize: 17, fontWeight: '600' },
+  placeInput: { color: '#fff', fontSize: 16, paddingVertical: 10 },
+  placeResult: { paddingVertical: 12, borderTopWidth: StyleSheet.hairlineWidth, borderColor: '#52525a' },
   rowDetail: { color: '#b9b9c0', fontSize: 14 },
   hint: {
     position: 'absolute',
