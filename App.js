@@ -5,15 +5,13 @@ import * as Location from 'expo-location';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import MapLibreGL from '@maplibre/maplibre-react-native';
 
-MapLibreGL.setAccessToken(null);
-
 // ---- Design tokens -------------------------------------------------------
 const PINK = '#FF2D95';
 const ROAD_WHITE = '#FFFFFF';
 const PANEL = 'rgba(20,20,22,0.92)';
 
 // Grayscale base map. Swap for a vector style (MapTiler/Mapbox) before launch.
-const MAP_STYLE = JSON.stringify({
+const MAP_STYLE = {
   version: 8,
   sources: {
     base: {
@@ -27,9 +25,10 @@ const MAP_STYLE = JSON.stringify({
     { id: 'bg', type: 'background', paint: { 'background-color': '#161616' } },
     { id: 'base', type: 'raster', source: 'base', paint: { 'raster-saturation': -1 } },
   ],
-});
+};
 
-const TRAIL_KEY = 'trail:v1';
+const TRAIL_KEY = 'trail:matched:v1';
+const MATCH_URL = process.env.EXPO_PUBLIC_OSRM_URL?.replace(/\/+$/, '');
 const ROUTES_KEY = 'routes:v1';
 const RIDES_KEY = 'rides:v1';
 
@@ -56,12 +55,38 @@ const fmtTime = (s) => {
 };
 const kmh = (ms) => Math.max(0, Math.round((ms || 0) * 3.6));
 
+async function matchRoads(samples) {
+  const coordinates = samples.map(({ point }) => point.join(',')).join(';');
+  const timestamps = samples.map(({ seconds }) => seconds).join(';');
+  const radiuses = samples.map(({ accuracy }) => accuracy).join(';');
+  const query = `geometries=geojson&overview=full&timestamps=${timestamps}&radiuses=${radiuses}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+  try {
+    const response = await fetch(`${MATCH_URL}/match/v1/driving/${coordinates}?${query}`, {
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error('Road matching request failed');
+    const result = await response.json();
+    if (result.code !== 'Ok') return [];
+    return (result.matchings ?? [])
+      .filter(({ confidence, geometry }) =>
+        confidence >= 0.7 && geometry?.type === 'LineString' && geometry.coordinates.length > 1)
+      .map(({ geometry }) => geometry.coordinates);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 // ---- App -----------------------------------------------------------------
 export default function App() {
   const cameraRef = useRef(null);
   const trailRef = useRef([]); // array of line segments
   const lastPtRef = useRef(null);
-  const unsavedRef = useRef(0);
+  const pendingSamples = useRef([]);
+  const matchQueue = useRef(Promise.resolve());
+  const [matchingFailed, setMatchingFailed] = useState(false);
+  const [trailLoaded, setTrailLoaded] = useState(false);
 
   const [trail, setTrail] = useState([]);
   const [routes, setRoutes] = useState([]);
@@ -91,32 +116,49 @@ export default function App() {
         const r = await AsyncStorage.getItem(ROUTES_KEY);
         if (r) setRoutes(JSON.parse(r));
       } catch (e) {}
+      setTrailLoaded(true);
     })();
   }, []);
 
-  const persistTrail = useCallback(() => {
-    AsyncStorage.setItem(TRAIL_KEY, JSON.stringify(trailRef.current)).catch(() => {});
-    unsavedRef.current = 0;
+  const flushSamples = useCallback((keepLast = false) => {
+    const samples = pendingSamples.current;
+    pendingSamples.current = keepLast ? samples.slice(-1) : [];
+    if (!MATCH_URL || samples.length < 2) return;
+
+    matchQueue.current = matchQueue.current.then(async () => {
+      try {
+        const matched = await matchRoads(samples);
+        if (!matched.length) return;
+        const next = [...trailRef.current, ...matched];
+        await AsyncStorage.setItem(TRAIL_KEY, JSON.stringify(next));
+        trailRef.current = next;
+        setTrail(next);
+        setMatchingFailed(false);
+      } catch {
+        setMatchingFailed(true);
+      }
+    });
   }, []);
 
   const onLocation = useCallback(
     (loc) => {
-      const pt = [loc.coords.longitude, loc.coords.latitude];
+      const { longitude, latitude, accuracy } = loc.coords;
+      const pt = [longitude, latitude];
       const prev = lastPtRef.current;
-
-      // Reveal trail: add a point once you've moved ~10m
-      if (!prev || distM(prev, pt) >= 10) {
-        const segs = trailRef.current;
-        let last = segs[segs.length - 1];
-        if (!last || !prev || distM(prev, pt) > 200) {
-          last = [];
-          segs.push(last);
+      if (MATCH_URL && accuracy > 0 && accuracy <= 30) {
+        const seconds = Math.floor(loc.timestamp / 1000);
+        const last = pendingSamples.current.at(-1);
+        if (last && (seconds - last.seconds > 30 || distM(last.point, pt) > 200)) {
+          flushSamples();
         }
-        last.push(pt);
-        unsavedRef.current += 1;
-        setTrail([...segs]);
-        if (unsavedRef.current >= 10) persistTrail();
+        const previousSample = pendingSamples.current.at(-1);
+        if (!previousSample || (seconds > previousSample.seconds && distM(previousSample.point, pt) >= 10)) {
+          pendingSamples.current.push({ point: pt, seconds, accuracy: Math.max(5, Math.round(accuracy)) });
+          if (pendingSamples.current.length >= 5) flushSamples(true);
+        }
+      }
 
+      if (!prev || distM(prev, pt) >= 10) {
         if (ridingRef.current) {
           if (prev) statsRef.current.meters += distM(prev, pt);
           rideLineRef.current.push(pt);
@@ -130,23 +172,30 @@ export default function App() {
         statsRef.current.top = Math.max(statsRef.current.top, sp);
       }
     },
-    [persistTrail]
+    [flushSamples]
   );
 
   // location watcher
   useEffect(() => {
+    if (!trailLoaded) return;
     let sub;
+    let active = true;
     (async () => {
       const { status } = await Location.requestForegroundPermissionsAsync();
+      if (!active) return;
       setPermission(status);
       if (status !== 'granted') return;
       sub = await Location.watchPositionAsync(
         { accuracy: Location.Accuracy.BestForNavigation, distanceInterval: 5, timeInterval: 1000 },
         onLocation
       );
+      if (!active) sub.remove();
     })();
-    return () => sub && sub.remove();
-  }, [onLocation]);
+    return () => {
+      active = false;
+      sub?.remove();
+    };
+  }, [onLocation, trailLoaded]);
 
   // ride timer
   useEffect(() => {
@@ -178,7 +227,7 @@ export default function App() {
       all.push(summary);
       await AsyncStorage.setItem(RIDES_KEY, JSON.stringify(all));
     } catch (e) {}
-    persistTrail();
+    flushSamples();
     Alert.alert(
       'Ride complete',
       `Time ${fmtTime(s.seconds)}\nDistance ${(s.meters / 1000).toFixed(2)} km\nTop speed ${kmh(s.top)} km/h`
@@ -277,6 +326,14 @@ export default function App() {
         {permission === 'denied' && (
           <View style={styles.banner}>
             <Text style={styles.bannerText}>Location is off. Turn it on in Settings to see yourself and unlock roads.</Text>
+          </View>
+        )}
+
+        {permission === 'granted' && (!MATCH_URL || matchingFailed) && (
+          <View style={styles.banner}>
+            <Text style={styles.bannerText}>
+              {MATCH_URL ? 'Road matching is temporarily unavailable.' : 'Road matching is unavailable in this build.'}
+            </Text>
           </View>
         )}
 
