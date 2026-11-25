@@ -160,10 +160,10 @@ function locateOnRoute(point, lines, offsets, previous) {
   return nearest;
 }
 
-async function planRoadRoute(points) {
+async function planRoadRoute(points, includeSurfaces = false) {
   // The Routing API takes latitude first. The response uses GeoJSON order.
   const waypoints = points.map(([lon, lat]) => `${lat},${lon}`).join('|');
-  const query = `waypoints=${encodeURIComponent(waypoints)}&mode=drive&format=geojson&apiKey=${encodeURIComponent(GEOAPIFY_TEST_KEY)}`;
+  const query = `waypoints=${encodeURIComponent(waypoints)}&mode=drive&format=geojson${includeSurfaces ? '&details=route_details' : ''}&apiKey=${encodeURIComponent(GEOAPIFY_TEST_KEY)}`;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 8000);
   try {
@@ -182,14 +182,19 @@ async function planRoadRoute(points) {
         return point && step.instruction?.text ? [{ point, text: step.instruction.text, meters: offsets[index][step.from_index] }] : [];
       })
     );
-    return { lines: geometry.coordinates.filter((line) => line.length > 1), steps, seconds: feature.properties?.time };
+    const unsealed = (feature.properties?.legs ?? []).flatMap((leg) => leg.steps ?? [])
+      .reduce((meters, step) => (
+        ['compacted', 'dirt', 'gravel', 'path', 'impassable'].includes(step.surface) ? meters + (step.distance ?? 0) : meters
+      ), 0);
+    return { lines: geometry.coordinates.filter((line) => line.length > 1), steps, seconds: feature.properties?.time, unsealed };
   } finally {
     clearTimeout(timeout);
   }
 }
 
-async function buildDirections(here, remaining) {
-  const { lines, steps, seconds } = await planRoadRoute([here, ...remaining]);
+async function buildDirections(here, remaining, plannedRoute) {
+  const { lines, steps: instructions, seconds } = plannedRoute ?? await planRoadRoute([here, ...remaining]);
+  const steps = [...instructions];
   if (!lines.length || !steps.length) return null;
   const offsets = routeOffsets(lines);
   const totalMeters = offsets.at(-1).at(-1);
@@ -202,6 +207,62 @@ async function buildDirections(here, remaining) {
     index: steps.length > 1 && distM(here, steps[0].point) <= 35 ? 1 : 0,
   };
 }
+
+function offsetPoint([lon, lat], bearing, meters) {
+  const arc = meters / 6_371_000;
+  const latitude = toRad(lat);
+  const angle = toRad(bearing);
+  const targetLat = Math.asin(Math.sin(latitude) * Math.cos(arc) +
+    Math.cos(latitude) * Math.sin(arc) * Math.cos(angle));
+  const targetLon = toRad(lon) + Math.atan2(Math.sin(angle) * Math.sin(arc) * Math.cos(latitude),
+    Math.cos(arc) - Math.sin(latitude) * Math.sin(targetLat));
+  return [((targetLon * 180 / Math.PI + 540) % 360) - 180, targetLat * 180 / Math.PI];
+}
+
+function trailCells(lines) {
+  const cells = new Set();
+  for (const line of lines) {
+    for (let index = 1; index < line.length; index += 1) {
+      const [lon, lat] = line[index - 1];
+      const [nextLon, nextLat] = line[index];
+      const deltaLon = ((nextLon - lon + 540) % 360) - 180;
+      const samples = Math.max(1, Math.ceil(distM(line[index - 1], line[index]) / 65));
+      for (let sample = 0; sample <= samples; sample += 1) {
+        const ratio = sample / samples;
+        const longitude = ((lon + deltaLon * ratio + 540) % 360) - 180;
+        cells.add(`${Math.floor(longitude * 1000)},${Math.floor((lat + (nextLat - lat) * ratio) * 1000)}`);
+      }
+    }
+  }
+  return cells;
+}
+
+async function findExploreLoop(here, minutes, preferSealed, unlockedLines) {
+  const unlocked = trailCells(unlockedLines);
+  const radius = minutes * 190;
+  const candidates = await Promise.allSettled([0, 90, 180, 270].map(async (heading, index) => {
+    const reach = radius * (index % 2 ? 1.25 : 0.85);
+    const waypoints = [here, offsetPoint(here, heading, reach), offsetPoint(here, heading + 65, reach), here];
+    const route = await planRoadRoute(waypoints, preferSealed);
+    if (!route.lines.length || !route.steps.length || !(route.seconds > 0)) return null;
+    const cells = trailCells(route.lines);
+    if (cells.size < 4) return null;
+    const novel = [...cells].filter((cell) => !unlocked.has(cell)).length / cells.size;
+    const minutesOff = Math.abs(route.seconds / 60 - minutes) / minutes;
+    const sealedPenalty = preferSealed ? Math.min(2, route.unsealed / 1000) : 0;
+    return { route, waypoints, score: novel * 0.35 - minutesOff - sealedPenalty };
+  }));
+  return candidates.flatMap((candidate) => candidate.status === 'fulfilled' && candidate.value ? [candidate.value] : [])
+    .sort((a, b) => b.score - a.score)[0];
+}
+
+const exploreShade = {
+  type: 'FeatureCollection',
+  features: [-180, -90, 0, 90].map((west) => ({
+    type: 'Feature', properties: {},
+    geometry: { type: 'Polygon', coordinates: [[[west, -85], [west + 90, -85], [west + 90, 85], [west, 85], [west, -85]]] },
+  })),
+};
 
 // ---- App -----------------------------------------------------------------
 export default function App() {
@@ -220,6 +281,10 @@ export default function App() {
   const [routes, setRoutes] = useState([]);
   const [rides, setRides] = useState([]);
   const [libraryView, setLibraryView] = useState(null);
+  const [explore, setExplore] = useState(false);
+  const [loopPlanner, setLoopPlanner] = useState(false);
+  const [loopMinutes, setLoopMinutes] = useState(60);
+  const [preferSealed, setPreferSealed] = useState(true);
   const [selectedRide, setSelectedRide] = useState(null);
   const [follow, setFollow] = useState(true);
   const [permission, setPermission] = useState(null);
@@ -702,6 +767,44 @@ export default function App() {
     setAddressPlanner(true);
   };
 
+  const generateLoop = async () => {
+    if (savingRouteRef.current) return;
+    const here = currentPoint.current;
+    if (!here || !GEOAPIFY_TEST_KEY) {
+      Alert.alert('Loop planner unavailable', here ? 'This build needs a Geoapify key.' : 'Wait for a GPS fix and try again.');
+      return;
+    }
+    savingRouteRef.current = true;
+    setSavingRoute(true);
+    try {
+      const result = await findExploreLoop(here, loopMinutes, preferSealed, trailRef.current);
+      if (!result) {
+        Alert.alert('No loop found', 'Try a different duration or starting location.');
+        return;
+      }
+      setNavigation(null);
+      setSelectedRide(null);
+      setDrawing(false);
+      setDraft([]);
+      setRoutePreview({
+        name: `Explore loop · ${Math.round(result.route.seconds / 60)} min`,
+        lines: result.route.lines,
+        seconds: result.route.seconds,
+        waypoints: result.route.lines.length === result.waypoints.length - 1
+          ? [here, ...result.route.lines.map((line) => line.at(-1))] : result.waypoints,
+        loop: true,
+        plannedRoute: result.route,
+      });
+      setLoopPlanner(false);
+      showOnMap(result.route.lines);
+    } catch {
+      Alert.alert('Could not plan loop', 'Check your connection and try again.');
+    } finally {
+      savingRouteRef.current = false;
+      setSavingRoute(false);
+    }
+  };
+
   const startDirections = async (route) => {
     if (savingRouteRef.current) return;
     const here = currentPoint.current;
@@ -715,7 +818,8 @@ export default function App() {
     savingRouteRef.current = true;
     setSavingRoute(true);
     try {
-      const directions = await buildDirections(here, remaining);
+      const planned = route.loop && route.waypoints && distM(here, route.waypoints[0]) <= 50 ? route.plannedRoute : undefined;
+      const directions = await buildDirections(here, remaining, planned);
       if (!directions) {
         Alert.alert('Directions unavailable', 'No turn instructions were returned for this route.');
         return;
@@ -798,12 +902,15 @@ export default function App() {
         <MapLibreGL.UserLocation visible androidRenderMode="normal" />
 
         {/* Unlocked roads: white trail that grows as you ride */}
+        <MapLibreGL.ShapeSource id="explore-shade" shape={exploreShade}>
+          <MapLibreGL.FillLayer id="explore-dim" style={{ fillColor: '#0b0b0d', fillOpacity: explore ? 0.48 : 0 }} />
+        </MapLibreGL.ShapeSource>
         <MapLibreGL.ShapeSource id="trail" shape={fc(trail)}>
           <MapLibreGL.LineLayer
             id="trail-glow"
             style={{
               lineColor: ROAD_WHITE,
-              lineOpacity: 0.25,
+              lineOpacity: explore ? 0.5 : 0.25,
               lineBlur: 6,
               lineCap: 'round',
               lineJoin: 'round',
@@ -822,10 +929,10 @@ export default function App() {
         </MapLibreGL.ShapeSource>
 
         {/* Saved routes: neon pink */}
-        <MapLibreGL.ShapeSource id="routes" shape={fc(routes.flatMap((route) => route.lines ?? [route.line]))}>
+        {!explore && <MapLibreGL.ShapeSource id="routes" shape={fc(routes.flatMap((route) => route.lines ?? [route.line]))}>
           <MapLibreGL.LineLayer id="routes-glow" style={pinkLayerStyle.glow} />
           <MapLibreGL.LineLayer id="routes-core" style={pinkLayerStyle.core} />
-        </MapLibreGL.ShapeSource>
+        </MapLibreGL.ShapeSource>}
 
         {selectedRide && (
           <MapLibreGL.ShapeSource id="recorded-ride" shape={fc(selectedRide.lines)}>
@@ -875,10 +982,19 @@ export default function App() {
       <SafeAreaView pointerEvents="box-none" style={StyleSheet.absoluteFill}>
         <View style={styles.topRow} pointerEvents="box-none">
           <RoundBtn label="History" onPress={() => setLibraryView('rides')} />
+          <RoundBtn label="Explore" active={explore} onPress={() => setExplore((enabled) => !enabled)} />
           <View style={{ flex: 1 }} />
           <RoundBtn label="Saved routes" onPress={() => setLibraryView('routes')} />
         </View>
 
+        {explore && !navigation && (
+          <View style={styles.banner}>
+            <Text style={styles.rowTitle}>{knownRoads.current.size} road sections unlocked</Text>
+            <Pressable accessibilityRole="button" style={styles.retryButton} onPress={() => setLoopPlanner(true)}>
+              <Text style={styles.retryText}>Plan an exploration loop</Text>
+            </Pressable>
+          </View>
+        )}
         {selectedRide && (
           <View style={styles.banner}>
             <Text style={[styles.bannerText, { color: '#69DBF5' }]}>
@@ -967,6 +1083,7 @@ export default function App() {
 
         {routePreview && !navigation && (
           <View style={styles.startDirections}>
+            {routePreview.loop && <Text style={styles.loopEstimate}>{Math.round(routePreview.seconds / 60)} min estimated loop</Text>}
             <Pill label={savingRoute ? 'Loading…' : 'Start directions'} primary disabled={savingRoute}
               onPress={() => startDirections(routePreview)} />
           </View>
@@ -975,7 +1092,7 @@ export default function App() {
         <View style={styles.bottomRow} pointerEvents="box-none">
           {routePreview && !navigation ? (
             <>
-              <Pill label="Edit" disabled={savingRoute} onPress={openPlanner} />
+              <Pill label={routePreview.loop ? "Change" : "Edit"} disabled={savingRoute} onPress={routePreview.loop ? () => setLoopPlanner(true) : openPlanner} />
               <Pill label="Close" disabled={savingRoute} onPress={() => setRoutePreview(null)} />
               <Pill label="Save route" primary disabled={savingRoute} onPress={saveAddressRoute} />
             </>
@@ -1001,6 +1118,30 @@ export default function App() {
           <Text style={styles.hint}>{draft.length ? `${draft.length}/12 waypoints` : 'Tap the map to add at least two waypoints'}</Text>
         )}
       </SafeAreaView>
+      <Modal visible={loopPlanner} animationType="slide" onRequestClose={() => {
+        if (!savingRoute) setLoopPlanner(false);
+      }}>
+        <SafeAreaView style={styles.root}>
+          <View style={styles.libraryHeader}>
+            <Text style={styles.libraryTitle}>Explore loop</Text>
+            <Pill label="Close" disabled={savingRoute} onPress={() => setLoopPlanner(false)} />
+          </View>
+          <View style={styles.libraryList}>
+            <Text style={styles.rowDetail}>Starts and ends at your current location.</Text>
+            <View style={styles.loopDurations}>
+              {[30, 60, 90].map((duration) => (
+                <Pill key={duration} label={`${duration} min`} primary={duration === loopMinutes}
+                  disabled={savingRoute} onPress={() => setLoopMinutes(duration)} />
+              ))}
+            </View>
+            <Pressable accessibilityRole="switch" accessibilityState={{ checked: preferSealed }}
+              style={styles.libraryRow} disabled={savingRoute} onPress={() => setPreferSealed((enabled) => !enabled)}>
+              <Text style={styles.rowTitle}>Prefer sealed roads · {preferSealed ? 'On' : 'Off'}</Text>
+            </Pressable>
+            <Pill label={savingRoute ? 'Comparing loops…' : 'Find a loop'} primary disabled={savingRoute} onPress={generateLoop} />
+          </View>
+        </SafeAreaView>
+      </Modal>
       <Modal visible={addressPlanner} animationType="slide" onRequestClose={() => {
         if (!savingRoute) setAddressPlanner(false);
       }}>
@@ -1039,7 +1180,7 @@ export default function App() {
                 <View key={route.id} style={styles.libraryRow}>
                   <Text style={styles.rowTitle}>{route.name}</Text>
                   <Pressable accessibilityRole="button" disabled={savingRoute} style={styles.placeResult}
-                    onPress={() => { setSelectedRide(null); setNavigation(null); showOnMap(route.lines ?? [route.line]); }}>
+                    onPress={() => { setSelectedRide(null); setNavigation(null); setExplore(false); showOnMap(route.lines ?? [route.line]); }}>
                     <Text style={styles.rowDetail}>Show on map</Text>
                   </Pressable>
                   <Pressable accessibilityRole="button" disabled={savingRoute} style={styles.placeResult} onPress={() => startDirections(route)}>
@@ -1163,6 +1304,8 @@ function Stat({ label, value }) {
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#161616' },
   topRow: { flexDirection: 'row', paddingHorizontal: 16, paddingTop: 8 },
+  loopDurations: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
+  loopEstimate: { color: "#fff", textAlign: "center", marginBottom: 6, backgroundColor: PANEL },
   startDirections: { alignSelf: 'center', marginBottom: 8 },
   bottomRow: {
     flexDirection: 'row',
