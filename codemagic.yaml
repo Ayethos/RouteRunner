@@ -14,6 +14,11 @@ workflows:
         script: npx expo prebuild --platform ios --clean --no-install
       - name: Install CocoaPods
         script: cd ios && pod install
+      - name: Patch fmt for Xcode 26
+        script: |
+          FMT_BASE=ios/Pods/fmt/include/fmt/base.h
+          sed -i '' 's/#elif defined(__apple_build_version__) && __apple_build_version__ < 14000029L/#elif defined(__apple_build_version__)/' "$FMT_BASE"
+          grep -n "FMT_USE_CONSTEVAL" "$FMT_BASE" | head
       - name: Build unsigned simulator app (Release)
         script: |
           WORKSPACE=$(ls -d ios/*.xcworkspace | head -1)
@@ -72,6 +77,11 @@ workflows:
         script: npx expo prebuild --platform ios --clean --no-install
       - name: Install CocoaPods
         script: cd ios && pod install
+      - name: Patch fmt for Xcode 26
+        script: |
+          FMT_BASE=ios/Pods/fmt/include/fmt/base.h
+          sed -i '' 's/#elif defined(__apple_build_version__) && __apple_build_version__ < 14000029L/#elif defined(__apple_build_version__)/' "$FMT_BASE"
+          grep -n "FMT_USE_CONSTEVAL" "$FMT_BASE" | head
       - name: Set up signing (Codemagic creates certificate and profile)
         script: |
           echo "$CERTIFICATE_KEY_B64" | base64 --decode > $HOME/cert_key.pem
