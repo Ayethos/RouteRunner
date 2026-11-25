@@ -35,6 +35,17 @@ const fc = (lines) => ({
     .filter((l) => l.length > 1)
     .map((l) => ({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: l } })),
 });
+function splitRecordedPath(points) {
+  const lines = [];
+  let previous;
+  for (const point of points ?? []) {
+    if (!previous || distM(previous, point) > 200) lines.push([]);
+    lines[lines.length - 1].push(point);
+    previous = point;
+  }
+  return lines.filter((line) => line.length > 1);
+}
+
 const fmtTime = (s) => {
   const m = Math.floor(s / 60);
   return `${m}:${String(s % 60).padStart(2, '0')}`;
@@ -108,6 +119,7 @@ export default function App() {
   const [routes, setRoutes] = useState([]);
   const [rides, setRides] = useState([]);
   const [libraryView, setLibraryView] = useState(null);
+  const [selectedRide, setSelectedRide] = useState(null);
   const [follow, setFollow] = useState(true);
   const [permission, setPermission] = useState(null);
   const [locationFailed, setLocationFailed] = useState(false);
@@ -256,6 +268,7 @@ export default function App() {
       Alert.alert('Location needed', 'Allow location access to start recording a ride.');
       return;
     }
+    setSelectedRide(null);
     rideStartedAt.current = Date.now();
     statsRef.current = { seconds: 0, meters: 0, speed: 0, top: 0 };
     rideLineRef.current = [];
@@ -329,8 +342,8 @@ export default function App() {
     }
   };
 
-  const showRoute = (route) => {
-    const points = (route.lines ?? [route.line]).flat();
+  const showOnMap = (lines) => {
+    const points = lines.flat();
     if (!points.length) return;
     const bounds = points.reduce((box, [lon, lat]) => ({
       west: Math.min(box.west, lon),
@@ -343,6 +356,16 @@ export default function App() {
     requestAnimationFrame(() => {
       cameraRef.current?.fitBounds([bounds.east, bounds.north], [bounds.west, bounds.south], 70, 450);
     });
+  };
+
+  const openRide = (ride) => {
+    const lines = splitRecordedPath(ride.line);
+    if (!lines.length) {
+      Alert.alert('No recorded path', 'This ride has too few connected GPS points to show on the map.');
+      return;
+    }
+    setSelectedRide({ ...ride, lines });
+    showOnMap(lines);
   };
 
   const pinkLayerStyle = {
@@ -406,6 +429,14 @@ export default function App() {
           <MapLibreGL.LineLayer id="routes-core" style={pinkLayerStyle.core} />
         </MapLibreGL.ShapeSource>
 
+        {selectedRide && (
+          <MapLibreGL.ShapeSource id="recorded-ride" shape={fc(selectedRide.lines)}>
+            <MapLibreGL.LineLayer id="recorded-ride-line" style={{
+              lineColor: '#69DBF5', lineWidth: 4, lineCap: 'round', lineJoin: 'round',
+            }} />
+          </MapLibreGL.ShapeSource>
+        )}
+
         {/* Route being drawn */}
         <MapLibreGL.ShapeSource id="draft" shape={fc([draft])}>
           <MapLibreGL.LineLayer id="draft-core" style={{ ...pinkLayerStyle.core, lineDasharray: [2, 2] }} />
@@ -432,6 +463,17 @@ export default function App() {
           <View style={{ flex: 1 }} />
           <RoundBtn label="Saved routes" onPress={() => setLibraryView('routes')} />
         </View>
+
+        {selectedRide && (
+          <View style={styles.banner}>
+            <Text style={[styles.bannerText, { color: '#69DBF5' }]}>
+              {new Date(selectedRide.date).toLocaleDateString()} · Recorded GPS path
+            </Text>
+            <Pressable accessibilityRole="button" style={styles.retryButton} onPress={() => setSelectedRide(null)}>
+              <Text style={styles.retryText}>Hide ride</Text>
+            </Pressable>
+          </View>
+        )}
 
         {mapFailed && (
           <View style={styles.banner}>
@@ -515,19 +557,23 @@ export default function App() {
           <ScrollView contentContainerStyle={styles.libraryList}>
             {libraryView === 'routes' ? (
               routes.length ? routes.map((route) => (
-                <Pressable accessibilityRole="button" key={route.id} style={styles.libraryRow} onPress={() => showRoute(route)}>
+                <Pressable accessibilityRole="button" key={route.id} style={styles.libraryRow} onPress={() => {
+                  setSelectedRide(null);
+                  showOnMap(route.lines ?? [route.line]);
+                }}>
                   <Text style={styles.rowTitle}>{route.name}</Text>
                   <Text style={styles.rowDetail}>Show on map</Text>
                 </Pressable>
               )) : <Text style={styles.rowDetail}>No saved routes yet. Use Route on the map to plan one.</Text>
             ) : (
               rides.length ? [...rides].sort((a, b) => b.date - a.date).map((ride, index) => (
-                <View key={`${ride.date}-${index}`} style={styles.libraryRow}>
+                <Pressable accessibilityRole="button" key={`${ride.date}-${index}`} style={styles.libraryRow} onPress={() => openRide(ride)}>
                   <Text style={styles.rowTitle}>{new Date(ride.date).toLocaleString()}</Text>
                   <Text style={styles.rowDetail}>
                     {`${(ride.meters / 1000).toFixed(2)} km · ${fmtTime(ride.seconds)} · Top ${kmh(ride.top)} km/h`}
                   </Text>
-                </View>
+                  <Text style={styles.rowDetail}>View recorded path</Text>
+                </Pressable>
               )) : <Text style={styles.rowDetail}>No rides yet. Start a ride from the map.</Text>
             )}
           </ScrollView>
