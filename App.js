@@ -104,33 +104,56 @@ async function matchRoads(samples) {
         match_type === 'matched' && Number.isFinite(match_distance) && match_distance <= 35
       );
       if (matched.length < 2 || geometry?.type !== 'MultiLineString') return [];
-      return geometry.coordinates.filter((line) =>
+      const roads = (properties.legs ?? []).flatMap((leg, index) =>
+        (leg.steps ?? []).flatMap((step) => {
+          const id = step.osm_way_id;
+          const line = geometry.coordinates[index]?.slice(step.from_index, step.to_index + 1);
+          return id && line?.length > 1 ? [{ id: String(id), line }] : [];
+        })
+      );
+      const lines = geometry.coordinates.filter((line) =>
         line.length > 1 && line.every(([lon, lat]) =>
           Number.isFinite(lon) && Math.abs(lon) <= 180 &&
           Number.isFinite(lat) && Math.abs(lat) <= 90)
       );
+      return [{ lines, roads }];
     });
   } finally {
     clearTimeout(timeout);
   }
 }
 
-function distanceFromRoute(point, lines) {
+function routeOffsets(lines) {
+  let meters = 0;
+  return lines.map((line) => line.map((point, index) => {
+    if (index) meters += distM(line[index - 1], point);
+    return meters;
+  }));
+}
+
+function locateOnRoute(point, lines, offsets, previous) {
   const lonScale = 111_195 * Math.cos(toRad(point[1]));
   const project = ([lon, lat]) => [
     (((lon - point[0] + 540) % 360) - 180) * lonScale,
     (lat - point[1]) * 111_195,
   ];
-  let nearest = Infinity;
-  for (const line of lines) {
+  let nearest = { distance: Infinity, meters: previous };
+  for (const [lineIndex, line] of lines.entries()) {
     let [ax, ay] = project(line[0]);
-    for (const vertex of line.slice(1)) {
+    for (let index = 1; index < line.length; index += 1) {
+      const vertex = line[index];
       const [bx, by] = project(vertex);
       const dx = bx - ax;
       const dy = by - ay;
       const lengthSquared = dx * dx + dy * dy;
       const ratio = lengthSquared ? Math.max(0, Math.min(1, -(ax * dx + ay * dy) / lengthSquared)) : 0;
-      nearest = Math.min(nearest, Math.hypot(ax + ratio * dx, ay + ratio * dy));
+      const distance = Math.hypot(ax + ratio * dx, ay + ratio * dy);
+      const [start, end] = [offsets[lineIndex][index - 1], offsets[lineIndex][index]];
+      const meters = start + ratio * (end - start);
+      if (distance < nearest.distance - 5 ||
+          (distance <= nearest.distance + 5 && Math.abs(meters - previous) < Math.abs(nearest.meters - previous))) {
+        nearest = { distance, meters };
+      }
       [ax, ay] = [bx, by];
     }
   }
@@ -152,27 +175,30 @@ async function planRoadRoute(points) {
     const feature = result.features?.[0];
     const geometry = feature?.geometry;
     if (geometry?.type !== 'MultiLineString') return { lines: [], steps: [] };
+    const offsets = routeOffsets(geometry.coordinates);
     const steps = (feature.properties?.legs ?? []).flatMap((leg, index) =>
       (leg.steps ?? []).flatMap((step) => {
         const point = geometry.coordinates[index]?.[step.from_index];
-        return point && step.instruction?.text ? [{ point, text: step.instruction.text }] : [];
+        return point && step.instruction?.text ? [{ point, text: step.instruction.text, meters: offsets[index][step.from_index] }] : [];
       })
     );
-    return { lines: geometry.coordinates.filter((line) => line.length > 1), steps };
+    return { lines: geometry.coordinates.filter((line) => line.length > 1), steps, seconds: feature.properties?.time };
   } finally {
     clearTimeout(timeout);
   }
 }
 
 async function buildDirections(here, remaining) {
-  const { lines, steps } = await planRoadRoute([here, ...remaining]);
+  const { lines, steps, seconds } = await planRoadRoute([here, ...remaining]);
   if (!lines.length || !steps.length) return null;
+  const offsets = routeOffsets(lines);
+  const totalMeters = offsets.at(-1).at(-1);
   const end = lines.at(-1).at(-1);
-  if (distM(steps.at(-1).point, end) > 10) {
-    steps.push({ point: end, text: 'Continue to your destination' });
+  if (totalMeters - steps.at(-1).meters > 10) {
+    steps.push({ point: end, meters: totalMeters, text: 'Continue to your destination' });
   }
   return {
-    lines, steps, remaining,
+    lines, steps, remaining, offsets, totalMeters, seconds, progress: 0,
     index: steps.length > 1 && distM(here, steps[0].point) <= 35 ? 1 : 0,
   };
 }
@@ -180,6 +206,9 @@ async function buildDirections(here, remaining) {
 // ---- App -----------------------------------------------------------------
 export default function App() {
   const cameraRef = useRef(null);
+  const knownRoads = useRef(new Set());
+  const rideUnlocks = useRef(new Map());
+  const rideMatchingFailed = useRef(false);
   const trailRef = useRef([]); // array of line segments
   const lastPtRef = useRef(null);
   const pendingSamples = useRef([]);
@@ -229,6 +258,7 @@ export default function App() {
   const activeLines = navigation?.lines;
   const arrived = navigation?.arrived;
   const remainingStops = navigation?.remaining;
+  const activeOffsets = navigation?.offsets;
   useEffect(() => {
     if (!activeLines || arrived) return;
     let active = true;
@@ -237,6 +267,7 @@ export default function App() {
     let lastRequest = 0;
     let rerouting = false;
     let remaining = remainingStops;
+    let progress = 0;
     const timer = setInterval(async () => {
       const fix = navigationFix.current;
       if (!fix || fix === previousFix || Date.now() - fix.timestamp > 10_000) return;
@@ -248,7 +279,8 @@ export default function App() {
         remaining = remaining.slice(1);
       }
 
-      const offRoute = distanceFromRoute(point, activeLines) > Math.max(55, accuracy * 2);
+      const fixOnRoute = locateOnRoute(point, activeLines, activeOffsets, progress);
+      const offRoute = fixOnRoute.distance > Math.max(55, accuracy * 2);
       offRouteFixes = offRoute ? offRouteFixes + 1 : 0;
       if (offRouteFixes >= 3 && !rerouting && Date.now() - lastRequest >= 15_000) {
         lastRequest = Date.now();
@@ -275,18 +307,18 @@ export default function App() {
       setRerouteStatus(null);
       setNavigation((state) => {
         if (!state || state.lines !== activeLines || state.arrived) return state;
-        const step = state.steps[state.index];
-        if (distM(point, step.point) > 35) return state;
-        return state.index + 1 < state.steps.length
-          ? { ...state, index: state.index + 1 }
-          : { ...state, arrived: true };
+        progress = Math.max(progress, fixOnRoute.meters);
+        let index = state.index;
+        while (index < state.steps.length - 1 && progress >= state.steps[index].meters + 8) index += 1;
+        const reached = progress >= state.totalMeters - 25 && distM(point, state.lines.at(-1).at(-1)) <= 30;
+        return { ...state, progress, index, arrived: reached };
       });
     }, 1000);
     return () => {
       active = false;
       clearInterval(timer);
     };
-  }, [activeLines, arrived, remainingStops]);
+  }, [activeLines, activeOffsets, arrived, remainingStops]);
   const [savingRoute, setSavingRoute] = useState(false);
   const savingRouteRef = useRef(false);
 
@@ -302,7 +334,9 @@ export default function App() {
       try {
         const t = await AsyncStorage.getItem(TRAIL_KEY);
         if (t) {
-          trailRef.current = JSON.parse(t);
+          const trailData = JSON.parse(t);
+          trailRef.current = Array.isArray(trailData) ? trailData : trailData.lines;
+          knownRoads.current = new Set(trailData.roadIds ?? []);
           setTrail([...trailRef.current]);
         }
         const r = await AsyncStorage.getItem(ROUTES_KEY);
@@ -321,12 +355,28 @@ export default function App() {
       try {
         const matched = await matchRoads(samples);
         if (!matched.length) return;
-        const next = [...trailRef.current, ...matched];
-        await AsyncStorage.setItem(TRAIL_KEY, JSON.stringify(next));
+        const next = [...trailRef.current, ...matched.flatMap(({ lines }) => lines)];
+        const fresh = new Map();
+        for (const { roads } of matched) {
+          for (const { id, line } of roads) {
+            if (!knownRoads.current.has(id)) {
+              const segments = fresh.get(id) ?? [];
+              segments.push(line);
+              fresh.set(id, segments);
+            }
+          }
+        }
+        const roadIds = [...knownRoads.current, ...fresh.keys()];
+        await AsyncStorage.setItem(TRAIL_KEY, JSON.stringify({ lines: next, roadIds }));
+        for (const [id, segments] of fresh) {
+          knownRoads.current.add(id);
+          rideUnlocks.current.set(id, segments);
+        }
         trailRef.current = next;
         setTrail(next);
         setMatchingFailed(false);
       } catch {
+        rideMatchingFailed.current = true;
         setMatchingFailed(true);
       }
     });
@@ -489,6 +539,8 @@ export default function App() {
     setScreenLockRecording(backgroundEnabled);
     setSelectedRide(null);
     lastRecordedTime.current = 0;
+    rideUnlocks.current = new Map();
+    rideMatchingFailed.current = false;
     rideStartedAt.current = startedAt;
     statsRef.current = { seconds: 0, meters: 0, speed: 0, top: 0 };
     rideLineRef.current = [];
@@ -519,12 +571,16 @@ export default function App() {
     setRiding(false);
     flushSamples();
     const date = Date.now();
+    await matchQueue.current;
     const summary = {
       ...statsRef.current,
       startedAt: rideStartedAt.current,
       date,
       seconds: Math.floor((date - rideStartedAt.current) / 1000),
       line: rideLineRef.current,
+      unlockCount: GEOAPIFY_TEST_KEY ? rideUnlocks.current.size : null,
+      unlockLines: [...rideUnlocks.current.values()].flat(),
+      unlocksIncomplete: rideMatchingFailed.current,
     };
     try {
       const raw = await AsyncStorage.getItem(RIDES_KEY);
@@ -535,7 +591,7 @@ export default function App() {
       await AsyncStorage.multiRemove([ACTIVE_RIDE_KEY, `${ACTIVE_RIDE_KEY}:${rideStartedAt.current}`]).catch(() => {});
       Alert.alert(
         'Ride saved',
-        `Time ${fmtTime(summary.seconds)}\nDistance ${formatDistance(summary.meters)}\nAverage speed ${formatSpeed(averageSpeed(summary))}\nTop speed ${formatSpeed(summary.top)}`
+        `Time ${fmtTime(summary.seconds)}\nDistance ${formatDistance(summary.meters)}\nAverage speed ${formatSpeed(averageSpeed(summary))}\nTop speed ${formatSpeed(summary.top)}${summary.unlockCount === null ? "" : `\nNew road sections: ${summary.unlockCount}${summary.unlocksIncomplete ? " (partial)" : ""}`}`
       );
     } catch {
       Alert.alert('Ride could not be saved', 'There was a problem writing to device storage.');
@@ -790,6 +846,12 @@ export default function App() {
           </MapLibreGL.ShapeSource>
         )}
 
+        {selectedRide?.unlockLines?.length > 0 && (
+          <MapLibreGL.ShapeSource id="ride-unlocks" shape={fc(selectedRide.unlockLines)}>
+            <MapLibreGL.LineLayer id="ride-unlocks-line" style={{ lineColor: '#77F2AE', lineWidth: 5, lineCap: 'round' }} />
+          </MapLibreGL.ShapeSource>
+        )}
+
         {/* Route being drawn */}
         <MapLibreGL.ShapeSource id="draft" shape={fc([draft])}>
           <MapLibreGL.LineLayer id="draft-core" style={{ ...pinkLayerStyle.core, lineDasharray: [2, 2] }} />
@@ -822,6 +884,7 @@ export default function App() {
             <Text style={[styles.bannerText, { color: '#69DBF5' }]}>
               {new Date(selectedRide.date).toLocaleDateString()} · Recorded GPS path
             </Text>
+            {selectedRide.unlockCount != null && <Text style={styles.rowDetail}>{selectedRide.unlockCount} new road sections{selectedRide.unlocksIncomplete ? ' (partial)' : ''} · Green on map</Text>}
             <Pressable accessibilityRole="button" style={styles.retryButton} onPress={() => setSelectedRide(null)}>
               <Text style={styles.retryText}>Hide ride</Text>
             </Pressable>
@@ -832,7 +895,15 @@ export default function App() {
           <View style={styles.banner}>
             <Text style={styles.rowTitle}>{navigation.arrived ? 'Destination reached' : rerouteStatus ?? navigation.steps[navigation.index].text}</Text>
             {!navigation.arrived && !rerouteStatus && navPoint && (
-              <Text style={styles.rowDetail}>{formatDistance(distM(navPoint, navigation.steps[navigation.index].point))} to maneuver</Text>
+              <Text style={styles.rowDetail}>{formatDistance(Math.max(0, navigation.steps[navigation.index].meters - navigation.progress))} to maneuver</Text>
+            )}
+            {!navigation.arrived && (
+              <Text style={styles.rowDetail}>
+                {formatDistance(navigation.totalMeters - navigation.progress)} left
+                {navigation.seconds > 0 && navigation.totalMeters > 0
+                  ? ` · ETA ${new Date(Date.now() + navigation.seconds * (1 - navigation.progress / navigation.totalMeters) * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`
+                  : ''}
+              </Text>
             )}
             <Pressable accessibilityRole="button" style={styles.retryButton} onPress={() => setNavigation(null)}>
               <Text style={styles.retryText}>End directions</Text>
@@ -986,6 +1057,7 @@ export default function App() {
                   <Text style={styles.rowDetail}>
                     {`${formatDistance(ride.meters)} · ${fmtTime(ride.seconds)}\nAvg ${formatSpeed(averageSpeed(ride))} · Top ${formatSpeed(ride.top)}`}
                   </Text>
+                  {ride.unlockCount != null && <Text style={styles.rowDetail}>{ride.unlockCount} new road sections{ride.unlocksIncomplete ? ' (partial)' : ''}</Text>}
                   <Text style={styles.rowDetail}>View recorded path</Text>
                 </Pressable>
               )) : <Text style={styles.rowDetail}>No rides yet. Start a ride from the map.</Text>
