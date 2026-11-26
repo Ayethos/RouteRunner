@@ -1,3 +1,4 @@
+import AccountGate from './AccountGate';
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { View, Text, Pressable, StyleSheet, Alert, SafeAreaView, Modal, ScrollView, Platform, TextInput, NativeModules, Image, useWindowDimensions } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
@@ -317,6 +318,10 @@ const exploreShade = {
 
 // ---- App -----------------------------------------------------------------
 export default function App() {
+  return <AccountGate>{(openAccount) => <RouteRunner openAccount={openAccount} />}</AccountGate>;
+}
+
+function RouteRunner({ openAccount }) {
   const cameraRef = useRef(null);
   const startupCameraPending = useRef(true);
   const [startupLocation, setStartupLocation] = useState(null);
@@ -1468,6 +1473,7 @@ export default function App() {
             ) : (
               <>
                 <RideHistory rides={rides} onOpen={openRide} onMenu={setRideMenu} />
+                <Pill label="Account" onPress={() => { setLibraryView(null); openAccount(); }} />
                 <Pill label="Privacy" onPress={() => setLibraryView('privacy')} />
               </>
             )}
