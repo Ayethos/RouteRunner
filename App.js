@@ -1,8 +1,12 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { View, Text, Pressable, StyleSheet, Alert, SafeAreaView, Modal, ScrollView, Platform, TextInput, NativeModules } from 'react-native';
+import { View, Text, Pressable, StyleSheet, Alert, SafeAreaView, Modal, ScrollView, Platform, TextInput, NativeModules, Image, useWindowDimensions } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
+import * as ImagePicker from 'expo-image-picker';
+import * as Sharing from 'expo-sharing';
+import Svg, { Polyline } from 'react-native-svg';
+import { captureRef, releaseCapture } from 'react-native-view-shot';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import MapLibreGL from '@maplibre/maplibre-react-native';
 
@@ -301,6 +305,8 @@ export default function App() {
   const [rides, setRides] = useState([]);
   const rideWrites = useRef(Promise.resolve());
   const [libraryView, setLibraryView] = useState(null);
+  const [rideMenu, setRideMenu] = useState(null);
+  const [shareRide, setShareRide] = useState(null);
   const [explore, setExplore] = useState(false);
   const [loopPlanner, setLoopPlanner] = useState(false);
   const [loopMinutes, setLoopMinutes] = useState(60);
@@ -888,8 +894,8 @@ export default function App() {
   };
 
   const deleteRide = (ride) => {
-    const isSameRide = (item) => ride.startedAt != null
-      ? item?.startedAt === ride.startedAt : item?.date === ride.date;
+    const isSameRide = (item) => item && (ride.startedAt != null
+      ? item.startedAt === ride.startedAt : item.startedAt == null && item.date === ride.date);
     Alert.alert('Delete this ride?', 'The ride will be removed from History. Unlocked roads stay on your map.', [
       { text: 'Cancel', style: 'cancel' },
       { text: 'Delete ride', style: 'destructive', onPress: async () => {
@@ -901,6 +907,22 @@ export default function App() {
         }
       } },
     ]);
+  };
+
+  const pinRide = async (ride) => {
+    setRideMenu(null);
+    try {
+      await updateRides((all) => all.map((item) =>
+        rideKey(item) === rideKey(ride) ? { ...item, pinned: !item.pinned } : item));
+    } catch {
+      Alert.alert('Could not update pin', 'Try again.');
+    }
+  };
+
+  const closeLibrary = () => {
+    if (shareRide) setShareRide(null);
+    else if (rideMenu) setRideMenu(null);
+    else setLibraryView(null);
   };
 
   const openRide = (ride) => {
@@ -1200,12 +1222,19 @@ export default function App() {
           </ScrollView>
         </SafeAreaView>
       </Modal>
-      <Modal visible={libraryView !== null} animationType="slide" onRequestClose={() => setLibraryView(null)}>
+      <Modal visible={libraryView !== null} animationType="slide" onRequestClose={closeLibrary}>
         <SafeAreaView style={styles.root}>
           <View style={styles.libraryHeader}>
-            <Text style={styles.libraryTitle}>{libraryView === 'routes' ? 'Saved routes' : 'Ride history'}</Text>
-            <RoundBtn label="Close" onPress={() => setLibraryView(null)} />
+            <Text style={styles.libraryTitle}>{shareRide ? 'Share ride' : rideMenu ? rideTitle(rideMenu) : libraryView === 'routes' ? 'Saved routes' : 'Ride history'}</Text>
+            <RoundBtn label={shareRide || rideMenu ? "Back" : "Close"} onPress={closeLibrary} />
           </View>
+          {shareRide ? <RideShare ride={shareRide} /> : rideMenu ? (
+            <View style={styles.libraryList}>
+              <Pill label={rideMenu.pinned ? 'Unpin ride' : 'Pin ride'} onPress={() => pinRide(rideMenu)} />
+              <Pill label="Share ride" onPress={() => { setShareRide(rideMenu); setRideMenu(null); }} />
+              <Pill label="Delete ride" onPress={() => { deleteRide(rideMenu); setRideMenu(null); }} />
+            </View>
+          ) : (
           <ScrollView contentContainerStyle={styles.libraryList}>
             {libraryView === 'routes' ? (
               routes.length ? routes.map((route) => (
@@ -1224,23 +1253,10 @@ export default function App() {
                 </View>
               )) : <Text style={styles.rowDetail}>No saved routes yet. Use Where to? on the map to plan one.</Text>
             ) : (
-              rides.length ? [...rides].sort((a, b) => b.date - a.date).map((ride, index) => (
-                <View key={`${ride.date}-${index}`} style={styles.libraryRow}>
-                  <Pressable accessibilityRole="button" onPress={() => openRide(ride)}>
-                  <Text style={styles.rowTitle}>{new Date(ride.date).toLocaleString()}</Text>
-                  <Text style={styles.rowDetail}>
-                    {`${formatDistance(ride.meters)} · ${fmtTime(ride.seconds)}\nAvg ${formatSpeed(averageSpeed(ride))} · Top ${formatSpeed(ride.top)}`}
-                  </Text>
-                  {ride.unlockCount != null && <Text style={styles.rowDetail}>{ride.unlockCount} new road sections{ride.unlocksIncomplete ? ' (partial)' : ''}</Text>}
-                    <Text style={styles.rowDetail}>View recorded path</Text>
-                  </Pressable>
-                  <Pressable accessibilityRole="button" style={styles.placeResult} onPress={() => deleteRide(ride)}>
-                    <Text style={styles.rowDetail}>Delete ride</Text>
-                  </Pressable>
-                </View>
-              )) : <Text style={styles.rowDetail}>No rides yet. Start a ride from the map.</Text>
+              <RideHistory rides={rides} onOpen={openRide} onMenu={setRideMenu} />
             )}
           </ScrollView>
+          )}
         </SafeAreaView>
       </Modal>
     </View>
@@ -1400,6 +1416,172 @@ function NavigationPanel({ navigation, rerouteStatus, onEnd }) {
   );
 }
 
+const rideKey = (ride) => ride.startedAt != null ? `started-${ride.startedAt}` : `saved-${ride.date}`;
+
+function rideTitle(ride) {
+  const hour = new Date(ride.startedAt ?? ride.date).getHours();
+  return `${hour < 5 || hour >= 20 ? 'Night' : hour < 12 ? 'Morning' : hour < 17 ? 'Afternoon' : 'Evening'} ride`;
+}
+
+function rideSections(rides) {
+  const sections = new Map();
+  for (const ride of [...rides].sort((a, b) => b.date - a.date)) {
+    const month = ride.pinned ? 'Pinned rides' : new Date(ride.date).toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+    if (!sections.has(month)) sections.set(month, []);
+    sections.get(month).push(ride);
+  }
+  return [...sections].sort(([a], [b]) => Number(b === 'Pinned rides') - Number(a === 'Pinned rides'));
+}
+
+function rideArtwork(ride) {
+  const lines = splitRecordedPath(ride.line);
+  if (!lines.length) return [];
+  const [origin, latitude] = lines[0][0];
+  const projected = lines.map((line) => line.map(([lon, lat]) => [
+    (((lon - origin + 540) % 360) - 180) * Math.cos(toRad(latitude)), latitude - lat,
+  ]));
+  const bounds = { left: Infinity, top: Infinity, right: -Infinity, bottom: -Infinity };
+  for (const line of projected) {
+    for (const [x, y] of line) {
+      bounds.left = Math.min(bounds.left, x);
+      bounds.top = Math.min(bounds.top, y);
+      bounds.right = Math.max(bounds.right, x);
+      bounds.bottom = Math.max(bounds.bottom, y);
+    }
+  }
+  const width = bounds.right - bounds.left;
+  const height = bounds.bottom - bounds.top;
+  const scale = Math.min(272 / Math.max(width, 1e-9), 196 / Math.max(height, 1e-9));
+  return projected.map((line) => line.map(([x, y]) =>
+    `${160 + (x - bounds.left - width / 2) * scale},${122 + (y - bounds.top - height / 2) * scale}`).join(' '));
+}
+
+function RideLine({ paths, thumbnail = false, withPhoto = false }) {
+  return (
+    <Svg width={thumbnail ? 78 : '100%'} height={thumbnail ? 68 : '66%'} viewBox="0 0 320 244">
+      {paths.map((points, index) => (
+        <React.Fragment key={index}>
+          <Polyline points={points} fill="none" stroke={withPhoto ? '#141416' : '#fff'}
+            strokeWidth={thumbnail ? 14 : 9} strokeLinejoin="round" strokeLinecap="round" />
+          <Polyline points={points} fill="none" stroke="#FF2D95"
+            strokeWidth={thumbnail ? 9 : 5} strokeLinejoin="round" strokeLinecap="round" />
+        </React.Fragment>
+      ))}
+    </Svg>
+  );
+}
+
+function RideHistory({ rides, onOpen, onMenu }) {
+  if (!rides.length) return <Text style={styles.rowDetail}>No rides yet. Start a ride from the map.</Text>;
+  return (
+    <>
+      <Text style={styles.rowDetail}>Tap to view a ride. Press and hold for ride options.</Text>
+      {rideSections(rides).map(([heading, entries]) => (
+        <View key={heading} style={styles.historySection}>
+          <Text accessibilityRole="header" style={styles.historyHeading}>{heading}</Text>
+          {entries.map((ride) => (
+            <Pressable key={rideKey(ride)} accessibilityRole="button"
+              accessibilityHint="Opens the ride. Use ride options to pin, delete or share."
+              accessibilityActions={[{ name: 'options', label: 'Ride options' }]}
+              onAccessibilityAction={(event) => { if (event.nativeEvent.actionName === 'options') onMenu(ride); }}
+              onPress={() => onOpen(ride)} onLongPress={() => onMenu(ride)}
+              style={({ pressed }) => [styles.historyCard, pressed && { opacity: 0.75 }]}>
+              <View style={styles.historyCardContent}>
+                <Text style={styles.rowTitle}>{rideTitle(ride)}</Text>
+                <Text style={styles.rowDetail}>{new Date(ride.date).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' })}</Text>
+                <Text style={styles.historyMetrics}>{formatDistance(ride.meters)}  ·  {fmtTime(ride.seconds)}</Text>
+                {ride.unlockCount != null && <Text style={styles.rowDetail}>{ride.unlockCount} new road sections{ride.unlocksIncomplete ? ' (partial)' : ''}</Text>}
+              </View>
+              <RideLine thumbnail paths={rideArtwork(ride)} />
+            </Pressable>
+          ))}
+        </View>
+      ))}
+    </>
+  );
+}
+
+function RideShare({ ride }) {
+  const { width } = useWindowDimensions();
+  const [photo, setPhoto] = useState(null);
+  const [photoReady, setPhotoReady] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const canvas = useRef(null);
+  const working = useRef(false);
+  const paths = React.useMemo(() => rideArtwork(ride), [ride]);
+  const size = Math.min(width - 32, 360);
+
+  const takePhoto = async () => {
+    if (working.current) return;
+    working.current = true;
+    setBusy(true);
+    try {
+      const { granted } = await ImagePicker.requestCameraPermissionsAsync();
+      if (!granted) {
+        Alert.alert('Camera access needed', 'Allow camera access in Settings to take a background photo.');
+        return;
+      }
+      const result = await ImagePicker.launchCameraAsync({ quality: 0.85, allowsEditing: false });
+      if (!result.canceled && result.assets[0]?.uri) {
+        setPhotoReady(false);
+        setPhoto(result.assets[0].uri);
+      }
+    } catch {
+      Alert.alert('Could not open camera', 'Try again, or share with a transparent background.');
+    } finally {
+      working.current = false;
+      setBusy(false);
+    }
+  };
+
+  const share = async () => {
+    if (working.current || !photoReady) return;
+    working.current = true;
+    setBusy(true);
+    let uri;
+    try {
+      if (!(await Sharing.isAvailableAsync())) {
+        Alert.alert('Sharing unavailable', 'This device does not support the share sheet.');
+        return;
+      }
+      uri = await captureRef(canvas.current, { format: 'png', useRenderInContext: true });
+      await Sharing.shareAsync(uri, { mimeType: 'image/png', UTI: 'public.png', dialogTitle: 'Share ride' });
+    } catch {
+      Alert.alert('Could not share ride', 'Try again.');
+    } finally {
+      if (uri) releaseCapture(uri);
+      working.current = false;
+      setBusy(false);
+    }
+  };
+
+  return (
+    <ScrollView contentContainerStyle={styles.libraryList}>
+      <Text style={styles.rowDetail}>{photo ? 'Photo background' : 'Transparent background'}{!photoReady && ' · Loading photo…'}</Text>
+      <View style={styles.sharePreview}>
+        <View ref={canvas} collapsable={false} style={[styles.shareCanvas, { width: size, height: size }]}>
+          {photo && (
+            <Image key={photo} source={{ uri: photo }} style={StyleSheet.absoluteFill} resizeMode="cover"
+              onLoad={() => setPhotoReady(true)} onError={() => {
+                setPhoto(null);
+                setPhotoReady(true);
+                Alert.alert('Photo could not load', 'Take another photo or share the transparent image.');
+              }} />
+          )}
+          <RideLine paths={paths} withPhoto={Boolean(photo)} />
+          <View style={styles.shareStats}>
+            <Text style={styles.shareMetric}>{formatDistance(ride.meters)}  ·  {fmtTime(ride.seconds)}</Text>
+            <Text style={styles.shareSpeed}>Avg {formatSpeed(averageSpeed(ride))}  ·  Top {formatSpeed(ride.top)}</Text>
+          </View>
+        </View>
+      </View>
+      <Pill label="Take background photo" disabled={busy} onPress={takePhoto} />
+      {photo && <Pill label="Remove photo" disabled={busy} onPress={() => { setPhoto(null); setPhotoReady(true); }} />}
+      <Pill label="Share PNG" primary disabled={busy || !photoReady} onPress={share} />
+    </ScrollView>
+  );
+}
+
 function RoundBtn({ label, onPress, active }) {
   return (
     <Pressable onPress={onPress} style={[styles.round, active && { borderColor: PINK }]}>
@@ -1484,6 +1666,16 @@ const styles = StyleSheet.create({
     padding: 16,
   },
   libraryTitle: { color: '#fff', fontSize: 25, fontWeight: '700' },
+  historySection: { gap: 9, marginTop: 8 },
+  historyHeading: { color: '#e6e6ea', fontSize: 16, fontWeight: '800', marginTop: 4 },
+  historyCard: { padding: 14, flexDirection: 'row', alignItems: 'center', gap: 10, borderRadius: 16, backgroundColor: '#222227' },
+  historyCardContent: { flex: 1, gap: 4 },
+  historyMetrics: { color: '#fff', fontWeight: '700', fontSize: 15 },
+  sharePreview: { alignSelf: 'center', backgroundColor: '#484850', borderRadius: 16, overflow: 'hidden' },
+  shareCanvas: { overflow: 'hidden', backgroundColor: 'transparent', justifyContent: 'space-between' },
+  shareStats: { alignItems: 'center', gap: 4, paddingBottom: 14 },
+  shareMetric: { color: '#fff', fontSize: 25, fontWeight: '800', backgroundColor: '#141416', paddingHorizontal: 8 },
+  shareSpeed: { color: '#fff', fontSize: 14, fontWeight: '700', backgroundColor: '#141416', paddingHorizontal: 8 },
   libraryList: { padding: 16, gap: 10 },
   libraryRow: { padding: 16, borderRadius: 14, backgroundColor: PANEL, gap: 5 },
   navigationPanel: { margin: 12, paddingHorizontal: 16, paddingTop: 12, backgroundColor: '#141416', borderRadius: 20 },
