@@ -964,7 +964,7 @@ export default function App() {
           followZoomLevel={15}
           defaultSettings={{ centerCoordinate: [0, 20], zoomLevel: 2 }}
         />
-        <MapLibreGL.UserLocation visible androidRenderMode="normal" />
+        <MapLibreGL.UserLocation visible renderMode="native" showsUserHeadingIndicator androidRenderMode="compass" />
 
         {/* Unlocked roads: white trail that grows as you ride */}
         <MapLibreGL.ShapeSource id="explore-shade" shape={exploreShade}>
