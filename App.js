@@ -260,8 +260,13 @@ function trailCells(lines) {
   return cells;
 }
 
-async function findExploreLoop(here, minutes, preferSealed, unlockedLines) {
-  const unlocked = trailCells(unlockedLines);
+const LOOP_MODES = [
+  { minutes: 30, color: '#54FF91' },
+  { minutes: 60, color: '#4BD9FF' },
+  { minutes: 90, color: '#FF526B' },
+];
+
+async function findExploreLoop(here, minutes, preferSealed, unlocked) {
   const radius = minutes * 190;
   const candidates = await Promise.allSettled([0, 90, 180, 270].map(async (heading, index) => {
     const reach = radius * (index % 2 ? 1.25 : 0.85);
@@ -273,10 +278,31 @@ async function findExploreLoop(here, minutes, preferSealed, unlockedLines) {
     const novel = [...cells].filter((cell) => !unlocked.has(cell)).length / cells.size;
     const minutesOff = Math.abs(route.seconds / 60 - minutes) / minutes;
     const sealedPenalty = preferSealed ? Math.min(2, route.unsealed / 1000) : 0;
-    return { route, waypoints, score: novel * 0.35 - minutesOff - sealedPenalty };
+    const meters = routeOffsets(route.lines).at(-1).at(-1);
+    return { route, waypoints, novel, cells, minutesOff, sealedPenalty, meters };
   }));
-  return candidates.flatMap((candidate) => candidate.status === 'fulfilled' && candidate.value ? [candidate.value] : [])
-    .sort((a, b) => b.score - a.score)[0];
+  return candidates.flatMap((candidate) => candidate.status === 'fulfilled' && candidate.value ? [candidate.value] : []);
+}
+
+async function findExploreOverview(here, preferSealed, unlockedLines) {
+  const unlocked = trailCells(unlockedLines);
+  const options = [];
+  for (const mode of LOOP_MODES) {
+    const candidates = await findExploreLoop(here, mode.minutes, preferSealed, unlocked);
+    const nearTarget = candidates.filter(({ minutesOff }) => minutesOff <= 0.3);
+    const eligible = nearTarget.length ? nearTarget : candidates;
+    const distinct = eligible.filter(({ cells }) => !options.some((option) => {
+      const overlap = [...cells].filter((cell) => option.cells.has(cell)).length;
+      return overlap / Math.max(cells.size, option.cells.size) > 0.9;
+    }));
+    const pool = distinct.length ? distinct : eligible;
+    const score = ({ novel, minutesOff, sealedPenalty }) => novel * 2 - minutesOff - sealedPenalty;
+    const best = nearTarget.length
+      ? pool.sort((a, b) => score(b) - score(a))[0]
+      : pool.sort((a, b) => a.minutesOff - b.minutesOff || score(b) - score(a))[0];
+    if (best) options.push({ ...mode, ...best });
+  }
+  return options;
 }
 
 const exploreShade = {
@@ -308,8 +334,8 @@ export default function App() {
   const [rideMenu, setRideMenu] = useState(null);
   const [shareRide, setShareRide] = useState(null);
   const [explore, setExplore] = useState(false);
-  const [loopPlanner, setLoopPlanner] = useState(false);
-  const [loopMinutes, setLoopMinutes] = useState(60);
+  const [exploreLoops, setExploreLoops] = useState([]);
+  const [findingLoops, setFindingLoops] = useState(false);
   const [preferSealed, setPreferSealed] = useState(true);
   const [selectedRide, setSelectedRide] = useState(null);
   const [follow, setFollow] = useState(true);
@@ -801,7 +827,7 @@ export default function App() {
     setAddressPlanner(true);
   };
 
-  const generateLoop = async () => {
+  const generateLoops = async (sealed = preferSealed) => {
     if (savingRouteRef.current) return;
     const here = currentPoint.current;
     if (!here || !GEOAPIFY_TEST_KEY) {
@@ -809,34 +835,36 @@ export default function App() {
       return;
     }
     savingRouteRef.current = true;
-    setSavingRoute(true);
+    setFindingLoops(true);
+    setRoutePreview(null);
+    setSelectedRide(null);
+    setDrawing(false);
+    setDraft([]);
     try {
-      const result = await findExploreLoop(here, loopMinutes, preferSealed, trailRef.current);
-      if (!result) {
-        Alert.alert('No loop found', 'Try a different duration or starting location.');
-        return;
-      }
-      setNavigation(null);
-      setSelectedRide(null);
-      setDrawing(false);
-      setDraft([]);
-      setRoutePreview({
-        name: `Explore loop · ${Math.round(result.route.seconds / 60)} min`,
-        lines: result.route.lines,
-        seconds: result.route.seconds,
-        waypoints: result.route.lines.length === result.waypoints.length - 1
-          ? [here, ...result.route.lines.map((line) => line.at(-1))] : result.waypoints,
-        loop: true,
-        plannedRoute: result.route,
-      });
-      setLoopPlanner(false);
-      showOnMap(result.route.lines);
+      const options = await findExploreOverview(here, sealed, trailRef.current);
+      setExploreLoops(options);
+      if (options.length) showOnMap(options.flatMap(({ route }) => route.lines));
+      else Alert.alert('No loops found', 'Try again from a different starting location.');
     } catch {
-      Alert.alert('Could not plan loop', 'Check your connection and try again.');
+      Alert.alert('Could not plan loops', 'Check your connection and try again.');
     } finally {
       savingRouteRef.current = false;
-      setSavingRoute(false);
+      setFindingLoops(false);
     }
+  };
+
+  const previewLoop = ({ minutes, color, route, waypoints }) => {
+    setRoutePreview({
+      name: `Explore loop · ${minutes} min target`,
+      lines: route.lines,
+      seconds: route.seconds,
+      waypoints: route.lines.length === waypoints.length - 1
+        ? [waypoints[0], ...route.lines.map((line) => line.at(-1))] : waypoints,
+      loop: true,
+      color,
+      plannedRoute: route,
+    });
+    showOnMap(route.lines);
   };
 
   const startDirections = async (route) => {
@@ -993,6 +1021,13 @@ export default function App() {
           />
         </MapLibreGL.ShapeSource>
 
+        {explore && !routePreview && !navigation && [...exploreLoops].reverse().map(({ minutes, color, route }) => (
+          <MapLibreGL.ShapeSource key={minutes} id={`explore-loop-${minutes}`} shape={fc(route.lines)}>
+            <MapLibreGL.LineLayer id={`explore-loop-line-${minutes}`}
+              style={{ ...pinkLayerStyle.core, lineColor: color, lineWidth: minutes === 90 ? 8 : minutes === 60 ? 6 : 4 }} />
+          </MapLibreGL.ShapeSource>
+        ))}
+
         {/* Saved routes: neon pink */}
         {!explore && <MapLibreGL.ShapeSource id="routes" shape={fc(routes.flatMap((route) => route.lines ?? [route.line]))}>
           <MapLibreGL.LineLayer id="routes-glow" style={pinkLayerStyle.glow} />
@@ -1014,7 +1049,7 @@ export default function App() {
         )}
         {routePreview && !navigation && (
           <MapLibreGL.ShapeSource id="address-preview" shape={fc(routePreview.lines)}>
-            <MapLibreGL.LineLayer id="address-preview-core" style={pinkLayerStyle.core} />
+            <MapLibreGL.LineLayer id="address-preview-core" style={{ ...pinkLayerStyle.core, lineColor: routePreview.color ?? pinkLayerStyle.core.lineColor }} />
           </MapLibreGL.ShapeSource>
         )}
 
@@ -1047,17 +1082,50 @@ export default function App() {
       <SafeAreaView pointerEvents="box-none" style={StyleSheet.absoluteFill}>
         <View style={styles.topRow} pointerEvents="box-none">
           <RoundBtn label="History" onPress={() => setLibraryView('rides')} />
-          <RoundBtn label="Explore" active={explore} onPress={() => setExplore((enabled) => !enabled)} />
+          <RoundBtn label="Explore" active={explore} onPress={() => {
+            if (findingLoops) return;
+            if (explore && routePreview?.loop) setRoutePreview(null);
+            setExplore(!explore);
+            if (!explore && !navigation && !routePreview) {
+              if (exploreLoops.length) showOnMap(exploreLoops.flatMap(({ route }) => route.lines));
+              else if (currentPoint.current && GEOAPIFY_TEST_KEY) generateLoops();
+            }
+          }} />
           <View style={{ flex: 1 }} />
           <RoundBtn label="Saved routes" onPress={() => setLibraryView('routes')} />
         </View>
 
-        {explore && !navigation && (
-          <View style={styles.banner}>
-            <Text style={styles.rowTitle}>{knownRoads.current.size} road sections unlocked</Text>
-            <Pressable accessibilityRole="button" style={styles.retryButton} onPress={() => setLoopPlanner(true)}>
-              <Text style={styles.retryText}>Plan an exploration loop</Text>
-            </Pressable>
+        {explore && !navigation && !routePreview && (
+          <View style={styles.explorePanel}>
+            <Text style={styles.rowTitle}>Explore loops</Text>
+            <Text style={styles.rowDetail}>{knownRoads.current.size} road sections unlocked</Text>
+            <View style={styles.exploreCards}>
+              {LOOP_MODES.map(({ minutes, color }) => {
+                const option = exploreLoops.find((loop) => loop.minutes === minutes);
+                return (
+                  <Pressable key={minutes} accessibilityRole="button"
+                    accessibilityLabel={`${minutes} minute target${option ? `, ${Math.round(option.route.seconds / 60)} minutes estimated` : ''}`}
+                    disabled={!option || findingLoops} onPress={() => previewLoop(option)}
+                    style={[styles.exploreCard, { borderColor: color }]}>
+                    <Text style={[styles.exploreDuration, { color }]}>{minutes} min</Text>
+                    <Text style={styles.exploreMetric}>{findingLoops ? 'Finding…' : option ? `~${Math.round(option.route.seconds / 60)} min` : 'Unavailable'}</Text>
+                    {option && !findingLoops && (
+                      <Text style={styles.exploreMetric}>{formatDistance(option.meters)} · {Math.round(option.novel * 100)}% new*</Text>
+                    )}
+                  </Pressable>
+                );
+              })}
+            </View>
+            {exploreLoops.length > 0 && <Text style={styles.exploreMetric}>*Estimated from your unlocked map.</Text>}
+            <View style={styles.exploreActions}>
+              <Pressable accessibilityRole="switch" accessibilityState={{ checked: preferSealed }} disabled={findingLoops}
+                onPress={() => { setPreferSealed(!preferSealed); if (exploreLoops.length) generateLoops(!preferSealed); }}>
+                <Text style={styles.retryText}>Prefer sealed {preferSealed ? '✓' : '○'}</Text>
+              </Pressable>
+              <Pressable accessibilityRole="button" disabled={findingLoops} onPress={() => generateLoops()}>
+                <Text style={styles.retryText}>{exploreLoops.length ? 'Refresh loops' : 'Find loops'}</Text>
+              </Pressable>
+            </View>
           </View>
         )}
         {selectedRide && (
@@ -1147,7 +1215,7 @@ export default function App() {
         <View style={styles.bottomRow} pointerEvents="box-none">
           {routePreview && !navigation ? (
             <>
-              <Pill label={routePreview.loop ? "Change" : "Edit"} disabled={savingRoute} onPress={routePreview.loop ? () => setLoopPlanner(true) : openPlanner} />
+              <Pill label={routePreview.loop ? "All loops" : "Edit"} disabled={savingRoute} onPress={routePreview.loop ? () => { setRoutePreview(null); showOnMap(exploreLoops.flatMap(({ route }) => route.lines)); } : openPlanner} />
               <Pill label="Close" disabled={savingRoute} onPress={() => setRoutePreview(null)} />
               <Pill label="Save route" primary disabled={savingRoute} onPress={saveAddressRoute} />
             </>
@@ -1172,30 +1240,6 @@ export default function App() {
           <Text style={styles.hint}>{draft.length ? `${draft.length}/12 waypoints` : 'Tap the map to add at least two waypoints'}</Text>
         )}
       </SafeAreaView>
-      <Modal visible={loopPlanner} animationType="slide" onRequestClose={() => {
-        if (!savingRoute) setLoopPlanner(false);
-      }}>
-        <SafeAreaView style={styles.root}>
-          <View style={styles.libraryHeader}>
-            <Text style={styles.libraryTitle}>Explore loop</Text>
-            <Pill label="Close" disabled={savingRoute} onPress={() => setLoopPlanner(false)} />
-          </View>
-          <View style={styles.libraryList}>
-            <Text style={styles.rowDetail}>Starts and ends at your current location.</Text>
-            <View style={styles.loopDurations}>
-              {[30, 60, 90].map((duration) => (
-                <Pill key={duration} label={`${duration} min`} primary={duration === loopMinutes}
-                  disabled={savingRoute} onPress={() => setLoopMinutes(duration)} />
-              ))}
-            </View>
-            <Pressable accessibilityRole="switch" accessibilityState={{ checked: preferSealed }}
-              style={styles.libraryRow} disabled={savingRoute} onPress={() => setPreferSealed((enabled) => !enabled)}>
-              <Text style={styles.rowTitle}>Prefer sealed roads · {preferSealed ? 'On' : 'Off'}</Text>
-            </Pressable>
-            <Pill label={savingRoute ? 'Comparing loops…' : 'Find a loop'} primary disabled={savingRoute} onPress={generateLoop} />
-          </View>
-        </SafeAreaView>
-      </Modal>
       <Modal visible={addressPlanner} animationType="slide" onRequestClose={() => {
         if (!savingRoute) setAddressPlanner(false);
       }}>
@@ -1608,7 +1652,12 @@ function Stat({ label, value }) {
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#161616' },
   topRow: { flexDirection: 'row', paddingHorizontal: 16, paddingTop: 8 },
-  loopDurations: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
+  explorePanel: { marginHorizontal: 12, marginTop: 8, borderRadius: 16, padding: 12, gap: 8, backgroundColor: PANEL },
+  exploreCards: { flexDirection: 'row', gap: 6 },
+  exploreCard: { flex: 1, minWidth: 0, padding: 8, borderRadius: 10, borderWidth: 1, gap: 3, backgroundColor: '#19191d' },
+  exploreDuration: { fontSize: 16, fontWeight: '800' },
+  exploreMetric: { color: '#d2d2d8', fontSize: 12 },
+  exploreActions: { flexDirection: 'row', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8, paddingVertical: 5 },
   loopEstimate: { color: "#fff", textAlign: "center", marginBottom: 6, backgroundColor: PANEL },
   startDirections: { alignSelf: 'center', marginBottom: 8 },
   discoveryNotice: { color: "#d2d2d8", backgroundColor: PANEL, alignSelf: "center", padding: 6, borderRadius: 8, marginBottom: 6, fontSize: 11 },
