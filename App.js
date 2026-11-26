@@ -1307,6 +1307,7 @@ function RouteRunner({ openAccount }) {
         logoEnabled={false}
         attributionPosition={{ bottom: 8, left: 8 }}
         compassEnabled={false}
+        rotateEnabled={false}
         onPress={onMapPress}
         onRegionWillChange={(f) => {
           if (f?.properties?.isUserInteraction) {
@@ -1320,6 +1321,7 @@ function RouteRunner({ openAccount }) {
           ref={cameraRef}
           followUserLocation={follow && hasLiveLocation}
           followUserMode={navigating ? "course" : "normal"}
+          heading={navigating ? undefined : 0}
           followHeading={navigating ? undefined : 0}
           followZoomLevel={15}
           defaultSettings={{ centerCoordinate: startupLocation ?? [0, 0], zoomLevel: startupLocation ? 13 : 0 }}
