@@ -1313,7 +1313,7 @@ function searchName(text) {
 
 async function searchPlaces(query, near, signal, nearbyFirst) {
   const name = searchName(query);
-  const isMcDonalds = name === 'mcdonald' || name === 'mcdonalds';
+  const isMcDonalds = ['mcdonald', 'mcdonalds', 'maccas'].includes(name);
   const lookup = isMcDonalds ? "McDonald's" : query.replace(/’/g, "'");
   const bias = near ? `&bias=${encodeURIComponent(`proximity:${near.join(',')}`)}` : '';
   const key = encodeURIComponent(GEOAPIFY_TEST_KEY);
