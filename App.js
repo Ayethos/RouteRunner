@@ -1,3 +1,4 @@
+import AccountGate from './AccountGate';
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { View, Text, Pressable, StyleSheet, Alert, SafeAreaView, Modal, ScrollView, Platform, TextInput, NativeModules, Image, useWindowDimensions } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
@@ -368,6 +369,10 @@ const exploreShade = {
 
 // ---- App -----------------------------------------------------------------
 export default function App() {
+  return <AccountGate>{(openAccount) => <RouteRunner openAccount={openAccount} />}</AccountGate>;
+}
+
+function RouteRunner({ openAccount }) {
   const cameraRef = useRef(null);
   const startupCameraPending = useRef(true);
   const [startupLocation, setStartupLocation] = useState(null);
@@ -1543,7 +1548,14 @@ export default function App() {
               <View style={styles.libraryList}>
                 {[['rides', 'Ride history'], ['routes', 'Saved routes'], ['settings', 'Settings'], ['account', 'Account']].map(([page, label]) => (
                   <Pressable key={page} accessibilityRole="button" style={styles.drawerItem}
-                    onPress={() => setLibraryView(page)}>
+                    onPress={() => {
+                      if (page === 'account') {
+                        setLibraryView(null);
+                        openAccount();
+                      } else {
+                        setLibraryView(page);
+                      }
+                    }}>
                     <Text style={styles.rowTitle}>{label}</Text>
                     <Text style={styles.rowDetail}>›</Text>
                   </Pressable>
@@ -1555,7 +1567,7 @@ export default function App() {
         ) : (
         <SafeAreaView style={styles.root}>
           <View style={styles.libraryHeader}>
-            <Text style={styles.libraryTitle}>{shareRide ? 'Share ride' : rideMenu ? rideTitle(rideMenu) : recapRide ? 'Ride recap' : libraryView === 'privacy' ? 'Privacy' : libraryView === 'settings' ? 'Settings' : libraryView === 'account' ? 'Account' : libraryView === 'routes' ? 'Saved routes' : 'Ride history'}</Text>
+            <Text style={styles.libraryTitle}>{shareRide ? 'Share ride' : rideMenu ? rideTitle(rideMenu) : recapRide ? 'Ride recap' : libraryView === 'privacy' ? 'Privacy' : libraryView === 'settings' ? 'Settings' : libraryView === 'routes' ? 'Saved routes' : 'Ride history'}</Text>
             <RoundBtn label="Back" onPress={closeLibrary} />
           </View>
           {shareRide ? <RideShare ride={shareRide} /> : rideMenu ? (
@@ -1582,11 +1594,6 @@ export default function App() {
                 )}
                 <Pill label="Privacy" onPress={() => setLibraryView('privacy')} />
               </>
-            ) : libraryView === 'account' ? (
-              <View style={styles.libraryRow}>
-                <Text style={styles.rowTitle}>Guest mode</Text>
-                <Text style={styles.rowDetail}>Your discoveries and rides are stored on this phone. Free accounts are coming in a future update.</Text>
-              </View>
             ) : libraryView === 'privacy' ? (
               <View style={styles.libraryRow}>
                 <Text style={styles.rowTitle}>Road discovery</Text>
