@@ -3,6 +3,7 @@
     "name": "Unlock Map",
     "slug": "unlock-map",
     "version": "0.1.0",
+    "icon": "./icon.png",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "ios": {
