@@ -1233,7 +1233,7 @@ function RouteRunner({ openAccount }) {
   useEffect(() => {
     let active = true;
     AsyncStorage.getItem(SIMPLIFIED_MAP_KEY).then((value) => {
-      if (active) setSimplifiedMap(value === 'on');
+      if (active) setSimplifiedMap(value !== 'off');
     }).catch(() => { if (active) setSimplifiedMap(false); });
     return () => { active = false; };
   }, []);
