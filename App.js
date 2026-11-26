@@ -299,6 +299,7 @@ export default function App() {
   const [trail, setTrail] = useState([]);
   const [routes, setRoutes] = useState([]);
   const [rides, setRides] = useState([]);
+  const rideWrites = useRef(Promise.resolve());
   const [libraryView, setLibraryView] = useState(null);
   const [explore, setExplore] = useState(false);
   const [loopPlanner, setLoopPlanner] = useState(false);
@@ -428,11 +429,23 @@ export default function App() {
     })();
   }, []);
 
+  const updateRides = (change) => {
+    const write = rideWrites.current.then(async () => {
+      const raw = await AsyncStorage.getItem(RIDES_KEY);
+      const next = change(raw ? JSON.parse(raw) : []);
+      await AsyncStorage.setItem(RIDES_KEY, JSON.stringify(next));
+      setRides(next);
+    });
+    rideWrites.current = write.catch(() => {});
+    return write;
+  };
+
   const flushSamples = useCallback((keepLast = false) => {
     const samples = pendingSamples.current;
     pendingSamples.current = keepLast ? samples.slice(-1) : [];
     if (!GEOAPIFY_TEST_KEY || samples.length < 2) return;
 
+    const rideId = samples[0].rideId;
     matchQueue.current = matchQueue.current.then(async () => {
       try {
         const matched = await matchRoads(samples);
@@ -452,13 +465,13 @@ export default function App() {
         await AsyncStorage.setItem(TRAIL_KEY, JSON.stringify({ lines: next, roadIds }));
         for (const [id, segments] of fresh) {
           knownRoads.current.add(id);
-          rideUnlocks.current.set(id, segments);
+          if (rideId != null && rideId === rideStartedAt.current) rideUnlocks.current.set(id, segments);
         }
         trailRef.current = next;
         setTrail(next);
         setMatchingFailed(false);
       } catch {
-        rideMatchingFailed.current = true;
+        if (rideId != null && rideId === rideStartedAt.current) rideMatchingFailed.current = true;
         setMatchingFailed(true);
       }
     });
@@ -466,29 +479,29 @@ export default function App() {
 
   const onLocation = useCallback(
     (loc) => {
-      if (!ridingRef.current || loc.timestamp < rideStartedAt.current ||
-          loc.timestamp <= lastRecordedTime.current) return;
       const { longitude, latitude, accuracy } = loc.coords;
       if (!(accuracy > 0 && accuracy <= 30)) return;
-      const gap = loc.timestamp - lastRecordedTime.current;
-      lastRecordedTime.current = loc.timestamp;
-      if (gap > 30_000) {
-        lastPtRef.current = null;
-        flushSamples();
-      }
       const pt = [longitude, latitude];
-      const prev = lastPtRef.current;
+      const recording = ridingRef.current && loc.timestamp >= rideStartedAt.current;
       if (GEOAPIFY_TEST_KEY) {
         const seconds = Math.floor(loc.timestamp / 1000);
+        const rideId = recording ? rideStartedAt.current : null;
+        const last = pendingSamples.current.at(-1);
+        if (last && (last.rideId !== rideId || seconds - last.seconds > 30)) flushSamples();
         if (pendingSamples.current.length && seconds - pendingSamples.current[0].seconds >= 30) {
           flushSamples(true);
         }
-        const previousSample = pendingSamples.current.at(-1);
-        if (!previousSample ||
-            (seconds - previousSample.seconds >= 2 && distM(previousSample.point, pt) >= 10)) {
-          pendingSamples.current.push({ point: pt, seconds });
+        const previous = pendingSamples.current.at(-1);
+        if (!previous || (seconds - previous.seconds >= 2 && distM(previous.point, pt) >= 10)) {
+          pendingSamples.current.push({ point: pt, seconds, rideId });
         }
       }
+
+      if (!recording || loc.timestamp <= lastRecordedTime.current) return;
+      const gap = loc.timestamp - lastRecordedTime.current;
+      lastRecordedTime.current = loc.timestamp;
+      if (gap > 30_000) lastPtRef.current = null;
+      const prev = lastPtRef.current;
 
       if (!prev || distM(prev, pt) >= 10) {
         if (ridingRef.current) {
@@ -525,6 +538,7 @@ export default function App() {
             const { accuracy } = location.coords;
             if (accuracy > 0 && accuracy <= 35) {
               navigationFix.current = { point: currentPoint.current, accuracy, timestamp: location.timestamp };
+              setSearchNear((near) => near ?? currentPoint.current);
             }
             if (!backgroundRideRef.current) onLocation(location);
           }
@@ -578,12 +592,12 @@ export default function App() {
   }, [riding, drainBackground]);
 
   useEffect(() => {
-    if (!riding || !GEOAPIFY_TEST_KEY) return;
+    if (!trailLoaded || !GEOAPIFY_TEST_KEY) return;
     const timer = setInterval(() => {
-      if (ridingRef.current) flushSamples(true);
+      flushSamples(true);
     }, MATCH_INTERVAL_MS);
     return () => clearInterval(timer);
-  }, [riding, flushSamples]);
+  }, [trailLoaded, flushSamples]);
 
   const startRide = async () => {
     if (ridingRef.current || finishingRideRef.current) return;
@@ -617,6 +631,7 @@ export default function App() {
         await AsyncStorage.removeItem(ACTIVE_RIDE_KEY).catch(() => {});
       }
     }
+    flushSamples();
     backgroundRideRef.current = backgroundEnabled;
     setScreenLockRecording(backgroundEnabled);
     setSelectedRide(null);
@@ -665,11 +680,7 @@ export default function App() {
       unlocksIncomplete: rideMatchingFailed.current,
     };
     try {
-      const raw = await AsyncStorage.getItem(RIDES_KEY);
-      const all = raw ? JSON.parse(raw) : [];
-      const next = [summary, ...all.filter((ride) => ride.startedAt !== summary.startedAt)];
-      await AsyncStorage.setItem(RIDES_KEY, JSON.stringify(next));
-      setRides(next);
+      await updateRides((all) => [summary, ...all.filter((ride) => ride.startedAt !== summary.startedAt)]);
       await AsyncStorage.multiRemove([ACTIVE_RIDE_KEY, `${ACTIVE_RIDE_KEY}:${rideStartedAt.current}`]).catch(() => {});
       Alert.alert(
         'Ride saved',
@@ -876,6 +887,22 @@ export default function App() {
     ]);
   };
 
+  const deleteRide = (ride) => {
+    const isSameRide = (item) => ride.startedAt != null
+      ? item?.startedAt === ride.startedAt : item?.date === ride.date;
+    Alert.alert('Delete this ride?', 'The ride will be removed from History. Unlocked roads stay on your map.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Delete ride', style: 'destructive', onPress: async () => {
+        try {
+          await updateRides((all) => all.filter((item) => !isSameRide(item)));
+          setSelectedRide((selected) => isSameRide(selected) ? null : selected);
+        } catch {
+          Alert.alert('Could not delete ride', 'Try again.');
+        }
+      } },
+    ]);
+  };
+
   const openRide = (ride) => {
     const lines = splitRecordedPath(ride.line);
     if (!lines.length) {
@@ -1076,8 +1103,8 @@ export default function App() {
         <View style={{ flex: 1 }} pointerEvents="none" />
 
         {GEOAPIFY_TEST_KEY && !drawing && (
-          <Text style={styles.hint}>
-            Road unlocking sends ride GPS points to Geoapify.
+          <Text style={styles.discoveryNotice}>
+            Road discovery sends GPS points to Geoapify.
           </Text>
         )}
 
@@ -1087,6 +1114,12 @@ export default function App() {
             <Pill label={savingRoute ? 'Loading…' : 'Start directions'} primary disabled={savingRoute}
               onPress={() => startDirections(routePreview)} />
           </View>
+        )}
+        {!drawing && !routePreview && !navigation && (
+          <Pressable accessibilityRole="button" accessibilityLabel="Search for a destination"
+            style={styles.mapSearch} onPress={openPlanner}>
+            <Text style={styles.mapSearchText}>⌕   Where to?</Text>
+          </Pressable>
         )}
         {/* Bottom controls */}
         <View style={styles.bottomRow} pointerEvents="box-none">
@@ -1104,7 +1137,6 @@ export default function App() {
             </>
           ) : (
             <>
-              <RoundBtn label="Route" onPress={openPlanner} />
               <Pill label={riding ? 'End ride' : 'Start ride'} primary onPress={riding ? endRide : startRide} />
               <RoundBtn
                 label="Locate"
@@ -1155,7 +1187,7 @@ export default function App() {
               onSelect={(place) => { setOrigin(place); setOriginNeedsSelection(false); }}
               onEdit={(value) => setOriginNeedsSelection(Boolean(value.trim()))} disabled={savingRoute} />
             {(origin || originNeedsSelection) && <Pill label="Use current location" disabled={savingRoute} onPress={() => { setOrigin(null); setOriginNeedsSelection(false); setOriginReset((value) => value + 1); }} />}
-            <PlaceSearch near={origin?.point ?? searchNear} title="To" placeholder="Search address or place" selected={destination}
+            <PlaceSearch autoFocus nearbyFirst near={origin?.point ?? searchNear} title="To" placeholder="Search address or place" selected={destination}
               onSelect={setDestination} disabled={savingRoute} />
             <Pill label={savingRoute ? "Finding roads…" : "Show route"} primary
               disabled={!destination || originNeedsSelection || savingRoute} onPress={previewAddressRoute} />
@@ -1190,17 +1222,22 @@ export default function App() {
                     <Text style={styles.rowDetail}>Delete route</Text>
                   </Pressable>
                 </View>
-              )) : <Text style={styles.rowDetail}>No saved routes yet. Use Route on the map to plan one.</Text>
+              )) : <Text style={styles.rowDetail}>No saved routes yet. Use Where to? on the map to plan one.</Text>
             ) : (
               rides.length ? [...rides].sort((a, b) => b.date - a.date).map((ride, index) => (
-                <Pressable accessibilityRole="button" key={`${ride.date}-${index}`} style={styles.libraryRow} onPress={() => openRide(ride)}>
+                <View key={`${ride.date}-${index}`} style={styles.libraryRow}>
+                  <Pressable accessibilityRole="button" onPress={() => openRide(ride)}>
                   <Text style={styles.rowTitle}>{new Date(ride.date).toLocaleString()}</Text>
                   <Text style={styles.rowDetail}>
                     {`${formatDistance(ride.meters)} · ${fmtTime(ride.seconds)}\nAvg ${formatSpeed(averageSpeed(ride))} · Top ${formatSpeed(ride.top)}`}
                   </Text>
                   {ride.unlockCount != null && <Text style={styles.rowDetail}>{ride.unlockCount} new road sections{ride.unlocksIncomplete ? ' (partial)' : ''}</Text>}
-                  <Text style={styles.rowDetail}>View recorded path</Text>
-                </Pressable>
+                    <Text style={styles.rowDetail}>View recorded path</Text>
+                  </Pressable>
+                  <Pressable accessibilityRole="button" style={styles.placeResult} onPress={() => deleteRide(ride)}>
+                    <Text style={styles.rowDetail}>Delete ride</Text>
+                  </Pressable>
+                </View>
               )) : <Text style={styles.rowDetail}>No rides yet. Start a ride from the map.</Text>
             )}
           </ScrollView>
@@ -1210,19 +1247,29 @@ export default function App() {
   );
 }
 
-async function searchPlaces(query, near, signal) {
+async function searchPlaces(query, near, signal, nearbyFirst) {
   const bias = near ? `&bias=${encodeURIComponent(`proximity:${near.join(',')}`)}` : '';
-  const params = `text=${encodeURIComponent(query)}&format=json&limit=5${bias}&apiKey=${encodeURIComponent(GEOAPIFY_TEST_KEY)}`;
-  const response = await fetch(`https://api.geoapify.com/v1/geocode/autocomplete?${params}`, { signal });
-  if (!response.ok) throw new Error('Place search failed');
-  const result = await response.json();
-  return (result.results ?? [])
-    .filter(({ formatted, lon, lat }) => formatted && Number.isFinite(lon) && Number.isFinite(lat))
-    .map(({ formatted, lon, lat }) => ({ label: formatted, point: [lon, lat] }));
+  const params = `text=${encodeURIComponent(query)}&format=json&limit=8${bias}&apiKey=${encodeURIComponent(GEOAPIFY_TEST_KEY)}`;
+  const fetchPlaces = async (filter = '') => {
+    const response = await fetch(`https://api.geoapify.com/v1/geocode/autocomplete?${params}${filter}`, { signal });
+    if (!response.ok) throw new Error('Place search failed');
+    const result = await response.json();
+    return (result.results ?? [])
+      .filter(({ formatted, lon, lat }) => formatted && Number.isFinite(lon) && Number.isFinite(lat))
+      .map(({ formatted, lon, lat }) => ({ label: formatted, point: [lon, lat] }));
+  };
+
+  if (near && nearbyFirst) {
+    const circle = encodeURIComponent(`circle:${near.join(',')},15000`);
+    const local = await fetchPlaces(`&filter=${circle}`);
+    if (local.length) return local.sort((a, b) => distM(near, a.point) - distM(near, b.point));
+  }
+  return fetchPlaces();
 }
 
-function PlaceSearch({ near, title, placeholder, selected, onSelect, onEdit, disabled }) {
+function PlaceSearch({ near, nearbyFirst = false, autoFocus = false, title, placeholder, selected, onSelect, onEdit, disabled }) {
   const [query, setQuery] = useState(selected?.label ?? '');
+  const [searchFarther, setSearchFarther] = useState(false);
   const [results, setResults] = useState([]);
   const [status, setStatus] = useState('');
   useEffect(() => {
@@ -1241,7 +1288,7 @@ function PlaceSearch({ near, title, placeholder, selected, onSelect, onEdit, dis
     const timer = setTimeout(async () => {
       setStatus('Searching…');
       try {
-        const places = await searchPlaces(query.trim(), near, controller.signal);
+        const places = await searchPlaces(query.trim(), near, controller.signal, nearbyFirst && !searchFarther);
         if (controller.signal.aborted) return;
         setResults(places);
         setStatus(places.length ? '' : 'No places found.');
@@ -1253,14 +1300,14 @@ function PlaceSearch({ near, title, placeholder, selected, onSelect, onEdit, dis
       clearTimeout(timer);
       controller.abort();
     };
-  }, [query, selected, disabled, near]);
+  }, [query, selected, disabled, near, nearbyFirst, searchFarther]);
 
   return (
     <View style={styles.libraryRow}>
       <Text style={styles.rowTitle}>{title}</Text>
       <TextInput accessibilityLabel={title} style={styles.placeInput} value={query}
         placeholder={placeholder} placeholderTextColor="#aaa" editable={!disabled}
-        autoCorrect={false} onChangeText={(value) => {
+        autoFocus={autoFocus} autoCorrect={false} onChangeText={(value) => {
           if (selected) onSelect(null);
           onEdit?.(value);
           setQuery(value);
@@ -1268,6 +1315,12 @@ function PlaceSearch({ near, title, placeholder, selected, onSelect, onEdit, dis
           setStatus('');
         }} />
       {status ? <Text style={styles.rowDetail}>{status}</Text> : null}
+      {near && nearbyFirst && !selected && query.trim().length >= 3 && (
+        <Pressable accessibilityRole="button" style={styles.placeResult} disabled={disabled}
+          onPress={() => { setResults([]); setSearchFarther((farther) => !farther); }}>
+          <Text style={styles.retryText}>{searchFarther ? 'Search nearby' : 'Search farther'}</Text>
+        </Pressable>
+      )}
       {results.map((place, index) => (
         <Pressable accessibilityRole="button" key={`${place.label}-${index}`}
           style={styles.placeResult} onPress={() => onSelect(place)}>
@@ -1346,6 +1399,9 @@ const styles = StyleSheet.create({
   loopDurations: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
   loopEstimate: { color: "#fff", textAlign: "center", marginBottom: 6, backgroundColor: PANEL },
   startDirections: { alignSelf: 'center', marginBottom: 8 },
+  discoveryNotice: { color: "#d2d2d8", backgroundColor: PANEL, alignSelf: "center", padding: 6, borderRadius: 8, marginBottom: 6, fontSize: 11 },
+  mapSearch: { marginHorizontal: 16, marginBottom: 10, padding: 15, borderRadius: 16, backgroundColor: PANEL, borderWidth: 1, borderColor: '#555' },
+  mapSearchText: { color: '#fff', fontSize: 18, fontWeight: '700' },
   bottomRow: {
     flexDirection: 'row',
     alignItems: 'center',
