@@ -1,7 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, Image, KeyboardAvoidingView, Platform, Pressable, SafeAreaView, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { AccessibilityInfo, ActivityIndicator, Alert, Animated, Easing, Image, KeyboardAvoidingView, Platform, Pressable, SafeAreaView, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
+import Svg, { Circle, Defs, LinearGradient, Path, Polyline, Rect, Stop } from 'react-native-svg';
 
 const AUTH_URL = process.env.EXPO_PUBLIC_SUPABASE_URL?.trim().replace(/\/+$/, '');
 const AUTH_KEY = process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY?.trim();
@@ -143,9 +144,10 @@ export default function AccountGate({ children }) {
   const selectMode = (next) => { setMode(next); setMessage(''); setPassword(''); };
   const welcome = (
     <SafeAreaView style={styles.screen}>
+      {!session && <DiscoveryBackdrop />}
       <KeyboardAvoidingView style={styles.grow} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.content}>
-          <Image source={require('./icon.png')} style={styles.icon} />
+          <Image source={require('./icon.png')} style={[styles.icon, !session && !mode && styles.heroIcon]} />
           <Text accessibilityRole="header" style={styles.title}>{session ? 'Your account' : 'Welcome to RouteRunner'}</Text>
           {session ? (
             <>
@@ -197,6 +199,85 @@ export default function AccountGate({ children }) {
   );
 }
 
+const AnimatedRoad = Animated.createAnimatedComponent(Polyline);
+const ROADS = [
+  { color: '#F5F5FA', nodes: [[180, 180], [157, 150], [109, 144], [75, 118], [33, 119], [0, 92]] },
+  { color: '#FF2D95', nodes: [[180, 180], [217, 153], [229, 111], [273, 92], [287, 53], [323, 29], [387, 24]] },
+  { color: '#F5F5FA', nodes: [[180, 180], [219, 189], [249, 221], [291, 217], [317, 247], [384, 259]] },
+  { color: '#FF7AB8', nodes: [[180, 180], [162, 216], [126, 236], [107, 277], [65, 287], [30, 325]] },
+  { color: '#F5F5FA', nodes: [[180, 180], [190, 142], [164, 106], [172, 63], [139, 40], [130, 0]] },
+  { color: '#FF2D95', nodes: [[180, 180], [192, 220], [173, 263], [186, 308], [175, 360], [210, 391]] },
+].map(({ color, nodes }) => ({
+  color,
+  points: nodes.map((point) => point.join(',')).join(' '),
+  length: Math.ceil(nodes.slice(1).reduce((total, [x, y], index) =>
+    total + Math.hypot(x - nodes[index][0], y - nodes[index][1]), 0)),
+}));
+
+function DiscoveryBackdrop() {
+  const progress = useRef(new Animated.Value(1)).current;
+  useEffect(() => {
+    let active = true;
+    let reveal;
+    const setMotion = (reduceMotion) => {
+      if (!active) return;
+      reveal?.stop();
+      if (reduceMotion) {
+        progress.setValue(1);
+        return;
+      }
+      progress.setValue(0);
+      reveal = Animated.timing(progress, {
+        toValue: 1, duration: 3600, easing: Easing.inOut(Easing.quad), useNativeDriver: false,
+      });
+      reveal.start();
+    };
+    let receivedChange = false;
+    const subscription = AccessibilityInfo.addEventListener('reduceMotionChanged', (reduceMotion) => {
+      receivedChange = true;
+      setMotion(reduceMotion);
+    });
+    AccessibilityInfo.isReduceMotionEnabled().then((reduceMotion) => {
+      if (!receivedChange) setMotion(reduceMotion);
+    }).catch(() => {});
+    return () => {
+      active = false;
+      reveal?.stop();
+      subscription.remove();
+    };
+  }, [progress]);
+
+  return (
+    <View pointerEvents="none" accessible={false} accessibilityElementsHidden
+      importantForAccessibility="no-hide-descendants" style={styles.backdrop}>
+      <Svg width="100%" height="100%" viewBox="0 0 360 760" preserveAspectRatio="xMidYMin slice">
+        <Defs>
+          <LinearGradient id="welcomeScrim" x1="0" y1="0" x2="0" y2="1">
+            <Stop offset="0" stopColor="#111114" stopOpacity={0.04} />
+            <Stop offset="0.25" stopColor="#111114" stopOpacity={0.2} />
+            <Stop offset="0.53" stopColor="#111114" stopOpacity={0.96} />
+            <Stop offset="1" stopColor="#111114" stopOpacity={1} />
+          </LinearGradient>
+        </Defs>
+        <Path d="M-20 166L54 167L96 189L151 181L205 203L260 185L310 190L385 154 M7 48L91 58L111 95L165 107L223 70L271 70L314 93L371 88 M-20 255L43 229L96 246L145 215L195 237L262 264L304 252L375 278 M72 -12L68 67L99 112L85 158L102 218L68 279L83 352 M231 -14L206 43L226 81L228 112L262 151L250 222L270 275L249 357 M331 -8L317 61L339 99L319 143L339 201L317 247L323 310 M15 318L74 340L143 316L196 348L254 340L322 363L379 343" stroke="#33333B" strokeWidth={1.8} fill="none" />
+        {ROADS.map(({ points, length, color }, index) => (
+          <React.Fragment key={points}>
+            <Polyline points={points} stroke="#41414C" strokeWidth={2.4} fill="none" />
+            <AnimatedRoad points={points} stroke={color} strokeWidth={2.8} strokeLinecap="round"
+              strokeLinejoin="round" fill="none" strokeDasharray={[length, length]}
+              strokeDashoffset={progress.interpolate({
+                inputRange: [index * 0.06, 0.64 + index * 0.06],
+                outputRange: [length, 0], extrapolate: 'clamp',
+              })} />
+          </React.Fragment>
+        ))}
+        <Circle cx={180} cy={180} r={7} fill="#FF2D95" stroke="#FFF" strokeWidth={2} />
+        <Rect width="100%" height="100%" fill="url(#welcomeScrim)" />
+      </Svg>
+    </View>
+  );
+}
+
 function Action({ label, onPress, primary, disabled }) {
   return (
     <Pressable accessibilityRole="button" disabled={disabled} onPress={onPress}
@@ -209,6 +290,8 @@ function Action({ label, onPress, primary, disabled }) {
 const styles = StyleSheet.create({
   accountOverlay: { ...StyleSheet.absoluteFillObject, zIndex: 30 },
   screen: { flex: 1, backgroundColor: '#111114' },
+  backdrop: { ...StyleSheet.absoluteFillObject, overflow: 'hidden' },
+  heroIcon: { marginTop: 74 },
   loading: { flex: 1, justifyContent: 'center', backgroundColor: '#111114' },
   grow: { flex: 1 },
   content: { flexGrow: 1, justifyContent: 'center', padding: 24, gap: 14 },
