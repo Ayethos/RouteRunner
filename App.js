@@ -17,6 +17,24 @@ const ROAD_WHITE = '#FFFFFF';
 const PANEL = 'rgba(20,20,22,0.92)';
 
 const MAP_STYLE = 'https://tiles.openfreemap.org/styles/dark';
+const SIMPLIFIED_MAP_KEY = 'simplified-map:v1';
+
+function simplifyMapStyle(style) {
+  if (style?.version !== 8 || !style.sources || !Array.isArray(style.layers)) {
+    throw new Error('Invalid map style');
+  }
+  const hideLayers = new Set(['road_area_pier', 'road_pier', 'road_oneway', 'road_oneway_opposite']);
+  const publicRoads = ['!', ['in', ['get', 'class'], ['literal', ['service', 'path', 'track']]]];
+  return {
+    ...style,
+    layers: style.layers.filter((layer) =>
+      !['building', 'poi'].includes(layer['source-layer']) && !hideLayers.has(layer.id))
+      .map((layer) => !['transportation', 'transportation_name'].includes(layer['source-layer']) ? layer : {
+        ...layer,
+        filter: layer.filter ? ['all', layer.filter, publicRoads] : publicRoads,
+      }),
+  };
+}
 
 const TRAIL_KEY = 'trail:matched:v1';
 const MATCH_INTERVAL_MS = 30_000;
@@ -374,6 +392,10 @@ export default function App() {
   const [rides, setRides] = useState([]);
   const rideWrites = useRef(Promise.resolve());
   const [libraryView, setLibraryView] = useState(null);
+  const [simplifiedMap, setSimplifiedMap] = useState(null);
+  const [simplifiedStyle, setSimplifiedStyle] = useState(null);
+  const [simplifiedStyleFailed, setSimplifiedStyleFailed] = useState(false);
+  const [styleAttempt, setStyleAttempt] = useState(0);
   const [rideMenu, setRideMenu] = useState(null);
   const [shareRide, setShareRide] = useState(null);
   const [explore, setExplore] = useState(false);
@@ -1112,9 +1134,49 @@ export default function App() {
     }
   };
 
+  useEffect(() => {
+    let active = true;
+    AsyncStorage.getItem(SIMPLIFIED_MAP_KEY).then((value) => {
+      if (active) setSimplifiedMap(value === 'on');
+    }).catch(() => { if (active) setSimplifiedMap(false); });
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
+    if (!simplifiedMap || simplifiedStyle) return;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+    let active = true;
+    setSimplifiedStyleFailed(false);
+    fetch(MAP_STYLE, { signal: controller.signal }).then(async (response) => {
+      if (!response.ok) throw new Error('Map style unavailable');
+      const style = simplifyMapStyle(await response.json());
+      if (active) setSimplifiedStyle(style);
+    }).catch(() => { if (active) setSimplifiedStyleFailed(true); })
+      .finally(() => clearTimeout(timeout));
+    return () => {
+      active = false;
+      clearTimeout(timeout);
+      controller.abort();
+    };
+  }, [simplifiedMap, simplifiedStyle, styleAttempt]);
+
+  const toggleSimplifiedMap = async () => {
+    const next = !simplifiedMap;
+    setSimplifiedMap(next);
+    try {
+      await AsyncStorage.setItem(SIMPLIFIED_MAP_KEY, next ? 'on' : 'off');
+    } catch {
+      setSimplifiedMap(!next);
+      Alert.alert('Could not save map preference', 'Try again.');
+    }
+  };
+
   const closeLibrary = () => {
     if (shareRide) setShareRide(null);
     else if (rideMenu) setRideMenu(null);
+    else if (libraryView === 'privacy') setLibraryView('settings');
+    else if (libraryView !== 'menu') setLibraryView('menu');
     else setLibraryView(null);
   };
 
@@ -1143,7 +1205,7 @@ export default function App() {
         onDidFailLoadingMap={() => setMapFailed(true)}
         onDidFinishLoadingMap={() => setMapFailed(false)}
         style={StyleSheet.absoluteFill}
-        mapStyle={MAP_STYLE}
+        mapStyle={simplifiedMap && simplifiedStyle ? simplifiedStyle : MAP_STYLE}
         logoEnabled={false}
         attributionPosition={{ bottom: 8, left: 8 }}
         compassEnabled={false}
@@ -1247,7 +1309,11 @@ export default function App() {
       {/* Top row */}
       <SafeAreaView pointerEvents="box-none" style={StyleSheet.absoluteFill}>
         <View style={styles.topRow} pointerEvents="box-none">
-          <RoundBtn label="History" onPress={() => setLibraryView('rides')} />
+          <Pressable accessibilityRole="button" accessibilityLabel="Open side menu" style={styles.round}
+            onPress={() => setLibraryView('menu')}>
+            <Text style={styles.menuIcon}>☰</Text>
+          </Pressable>
+          <View style={{ flex: 1 }} />
           <RoundBtn label="Explore" active={explore} onPress={() => {
             if (findingLoops) return;
             if (explore && routePreview?.loop) setRoutePreview(null);
@@ -1257,8 +1323,6 @@ export default function App() {
               else if (currentPoint.current && GEOAPIFY_TEST_KEY) generateLoops();
             }
           }} />
-          <View style={{ flex: 1 }} />
-          <RoundBtn label="Saved routes" onPress={() => setLibraryView('routes')} />
         </View>
 
         {explore && !navigation && !routePreview && (
@@ -1464,11 +1528,32 @@ export default function App() {
           </ScrollView>
         </SafeAreaView>
       </Modal>
-      <Modal visible={libraryView !== null} animationType="slide" onRequestClose={closeLibrary}>
+      <Modal visible={libraryView !== null} transparent animationType="fade" onRequestClose={closeLibrary}>
+        {libraryView === 'menu' ? (
+          <View style={styles.drawerBackdrop}>
+            <Pressable accessibilityRole="button" accessibilityLabel="Close side menu"
+              style={StyleSheet.absoluteFill} onPress={() => setLibraryView(null)} />
+            <SafeAreaView style={styles.drawer}>
+              <View style={styles.libraryHeader}>
+                <Text style={styles.libraryTitle}>RouteRunner</Text>
+              </View>
+              <View style={styles.libraryList}>
+                {[['rides', 'Ride history'], ['routes', 'Saved routes'], ['settings', 'Settings'], ['account', 'Account']].map(([page, label]) => (
+                  <Pressable key={page} accessibilityRole="button" style={styles.drawerItem}
+                    onPress={() => setLibraryView(page)}>
+                    <Text style={styles.rowTitle}>{label}</Text>
+                    <Text style={styles.rowDetail}>›</Text>
+                  </Pressable>
+                ))}
+                <Pill label="Close menu" onPress={() => setLibraryView(null)} />
+              </View>
+            </SafeAreaView>
+          </View>
+        ) : (
         <SafeAreaView style={styles.root}>
           <View style={styles.libraryHeader}>
-            <Text style={styles.libraryTitle}>{shareRide ? 'Share ride' : rideMenu ? rideTitle(rideMenu) : libraryView === 'privacy' ? 'Privacy' : libraryView === 'routes' ? 'Saved routes' : 'Ride history'}</Text>
-            <RoundBtn label={shareRide || rideMenu ? "Back" : "Close"} onPress={closeLibrary} />
+            <Text style={styles.libraryTitle}>{shareRide ? 'Share ride' : rideMenu ? rideTitle(rideMenu) : libraryView === 'privacy' ? 'Privacy' : libraryView === 'settings' ? 'Settings' : libraryView === 'account' ? 'Account' : libraryView === 'routes' ? 'Saved routes' : 'Ride history'}</Text>
+            <RoundBtn label="Back" onPress={closeLibrary} />
           </View>
           {shareRide ? <RideShare ride={shareRide} /> : rideMenu ? (
             <View style={styles.libraryList}>
@@ -1478,7 +1563,26 @@ export default function App() {
             </View>
           ) : (
           <ScrollView contentContainerStyle={styles.libraryList}>
-            {libraryView === 'privacy' ? (
+            {libraryView === 'settings' ? (
+              <>
+                <Pressable accessibilityRole="switch" accessibilityState={{ checked: simplifiedMap === true }}
+                  disabled={simplifiedMap === null} style={styles.libraryRow} onPress={toggleSimplifiedMap}>
+                  <Text style={styles.rowTitle}>Simplified map · {simplifiedMap ? 'On' : 'Off'}</Text>
+                  <Text style={styles.rowDetail}>Keep streets and road names. Hide car park lanes, paths and building outlines.</Text>
+                </Pressable>
+                {simplifiedMap && !simplifiedStyle && (
+                  simplifiedStyleFailed
+                    ? <Pill label="Retry loading simplified map" onPress={() => setStyleAttempt((value) => value + 1)} />
+                    : <Text style={styles.rowDetail}>Loading simplified map…</Text>
+                )}
+                <Pill label="Privacy" onPress={() => setLibraryView('privacy')} />
+              </>
+            ) : libraryView === 'account' ? (
+              <View style={styles.libraryRow}>
+                <Text style={styles.rowTitle}>Guest mode</Text>
+                <Text style={styles.rowDetail}>Your discoveries and rides are stored on this phone. Free accounts are coming in a future update.</Text>
+              </View>
+            ) : libraryView === 'privacy' ? (
               <View style={styles.libraryRow}>
                 <Text style={styles.rowTitle}>Road discovery</Text>
                 <Text style={styles.rowDetail}>When enabled, GPS points are sent to Geoapify to match the roads you travel. RouteRunner stores unlocked roads and ride history on this device.</Text>
@@ -1506,14 +1610,12 @@ export default function App() {
                 </View>
               )) : <Text style={styles.rowDetail}>No saved routes yet. Use Where to? on the map to plan one.</Text>
             ) : (
-              <>
-                <RideHistory rides={rides} onOpen={openRide} onMenu={setRideMenu} />
-                <Pill label="Privacy" onPress={() => setLibraryView('privacy')} />
-              </>
+              <RideHistory rides={rides} onOpen={openRide} onMenu={setRideMenu} />
             )}
           </ScrollView>
           )}
         </SafeAreaView>
+        )}
       </Modal>
     </View>
   );
@@ -1962,6 +2064,10 @@ const styles = StyleSheet.create({
   shareSpeed: { color: '#fff', fontSize: 14, fontWeight: '700', backgroundColor: '#141416', paddingHorizontal: 8 },
   quickPlaces: { flexDirection: 'row', gap: 8 },
   quickPlace: { flex: 1, minWidth: 0 },
+  menuIcon: { color: '#fff', fontSize: 23, lineHeight: 29 },
+  drawerBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.62)' },
+  drawer: { flex: 1, width: '78%', maxWidth: 340, backgroundColor: '#19191d', borderRightWidth: 1, borderColor: '#35353d' },
+  drawerItem: { minHeight: 54, paddingHorizontal: 14, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: '#25252b', borderRadius: 12 },
   libraryList: { padding: 16, gap: 10 },
   libraryRow: { padding: 16, borderRadius: 14, backgroundColor: PANEL, gap: 5 },
   navigationPanel: { margin: 12, paddingHorizontal: 16, paddingTop: 12, backgroundColor: '#141416', borderRadius: 20 },
