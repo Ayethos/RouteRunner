@@ -328,6 +328,12 @@ export default function App() {
   const lastPtRef = useRef(null);
   const pendingSamples = useRef([]);
   const matchQueue = useRef(Promise.resolve());
+  const offlineBatches = useRef([]);
+  const appliedRideBatches = useRef(new Set());
+  const unstoredBatches = useRef(new Map());
+  const retryMatchingAt = useRef(0);
+  const matchingActive = useRef(false);
+  const [pendingMatches, setPendingMatches] = useState(0);
   const [matchingFailed, setMatchingFailed] = useState(false);
   const [trailLoaded, setTrailLoaded] = useState(false);
 
@@ -467,6 +473,8 @@ export default function App() {
           const trailData = JSON.parse(t);
           trailRef.current = Array.isArray(trailData) ? trailData : trailData.lines;
           knownRoads.current = new Set(trailData.roadIds ?? []);
+          offlineBatches.current = trailData.pending ?? [];
+          setPendingMatches(offlineBatches.current.length);
           setTrail([...trailRef.current]);
         }
         const r = await AsyncStorage.getItem(ROUTES_KEY);
@@ -476,7 +484,7 @@ export default function App() {
     })();
   }, []);
 
-  const updateRides = (change) => {
+  const updateRides = useCallback((change) => {
     const write = rideWrites.current.then(async () => {
       const raw = await AsyncStorage.getItem(RIDES_KEY);
       const next = change(raw ? JSON.parse(raw) : []);
@@ -485,44 +493,102 @@ export default function App() {
     });
     rideWrites.current = write.catch(() => {});
     return write;
-  };
+  }, []);
 
-  const flushSamples = useCallback((keepLast = false) => {
-    const samples = pendingSamples.current;
-    pendingSamples.current = keepLast ? samples.slice(-1) : [];
-    if (!GEOAPIFY_TEST_KEY || samples.length < 2) return;
-
-    const rideId = samples[0].rideId;
-    matchQueue.current = matchQueue.current.then(async () => {
-      try {
-        const matched = await matchRoads(samples);
-        if (!matched.length) return;
-        const next = [...trailRef.current, ...matched.flatMap(({ lines }) => lines)];
-        const fresh = new Map();
-        for (const { roads } of matched) {
-          for (const { id, line } of roads) {
-            if (!knownRoads.current.has(id)) {
+  const processMatches = useCallback(async () => {
+    if (!GEOAPIFY_TEST_KEY || matchingActive.current || Date.now() < retryMatchingAt.current) return;
+    await matchQueue.current;
+    if (matchingActive.current || !offlineBatches.current.length || Date.now() < retryMatchingAt.current) return;
+    matchingActive.current = true;
+    try {
+      const batch = offlineBatches.current[0];
+      const matched = batch.matched ?? await matchRoads(batch.samples);
+      const write = matchQueue.current.then(async () => {
+        const fresh = batch.fresh ? new Map(batch.fresh) : new Map();
+        if (!batch.matched) {
+          for (const { roads } of matched) {
+            for (const { id, line } of roads) {
+              if (knownRoads.current.has(id)) continue;
               const segments = fresh.get(id) ?? [];
               segments.push(line);
               fresh.set(id, segments);
             }
           }
+          const lines = [...trailRef.current, ...matched.flatMap((entry) => entry.lines)];
+          const roadIds = [...knownRoads.current, ...fresh.keys()];
+          const pending = [{ ...batch, matched: [], fresh: [...fresh] }, ...offlineBatches.current.slice(1)];
+          await AsyncStorage.setItem(TRAIL_KEY, JSON.stringify({ lines, roadIds, pending }));
+          trailRef.current = lines;
+          knownRoads.current = new Set(roadIds);
+          offlineBatches.current = pending;
+          setTrail(lines);
         }
-        const roadIds = [...knownRoads.current, ...fresh.keys()];
-        await AsyncStorage.setItem(TRAIL_KEY, JSON.stringify({ lines: next, roadIds }));
-        for (const [id, segments] of fresh) {
-          knownRoads.current.add(id);
-          if (rideId != null && rideId === rideStartedAt.current) rideUnlocks.current.set(id, segments);
+
+        const rideId = batch.samples[0].rideId;
+        const pending = offlineBatches.current.slice(1);
+        if (rideId != null) {
+          if (rideId === rideStartedAt.current) {
+            for (const [id, segments] of fresh) rideUnlocks.current.set(id, segments);
+            appliedRideBatches.current.add(batch.id);
+          }
+          await updateRides((rides) => rides.map((ride) => {
+            if (ride.startedAt !== rideId) return ride;
+            const applied = ride.appliedMatchBatches ?? [];
+            const alreadyApplied = applied.includes(batch.id);
+            return {
+              ...ride,
+              unlockCount: (ride.unlockCount ?? 0) + (alreadyApplied ? 0 : fresh.size),
+              unlockLines: alreadyApplied ? ride.unlockLines : [...(ride.unlockLines ?? []), ...[...fresh.values()].flat()],
+              appliedMatchBatches: alreadyApplied ? applied : [...applied, batch.id],
+              unlocksIncomplete: pending.some(({ samples }) => samples[0].rideId === rideId),
+            };
+          }));
         }
-        trailRef.current = next;
-        setTrail(next);
+
+        await AsyncStorage.setItem(TRAIL_KEY, JSON.stringify({
+          lines: trailRef.current, roadIds: [...knownRoads.current], pending,
+        }));
+        offlineBatches.current = pending;
+        setPendingMatches(pending.length);
         setMatchingFailed(false);
-      } catch {
-        if (rideId != null && rideId === rideStartedAt.current) rideMatchingFailed.current = true;
-        setMatchingFailed(true);
-      }
+      });
+      matchQueue.current = write.catch(() => {});
+      await write;
+    } catch {
+      retryMatchingAt.current = Date.now() + 30_000;
+      setMatchingFailed(true);
+    } finally {
+      matchingActive.current = false;
+    }
+  }, [updateRides]);
+
+  const flushSamples = useCallback((keepLast = false) => {
+    const samples = pendingSamples.current;
+    pendingSamples.current = keepLast ? samples.slice(-1) : [];
+    if (!GEOAPIFY_TEST_KEY) return;
+    if (samples.length >= 2) {
+      const id = `${samples[0].rideId ?? 'free'}:${samples[0].seconds}:${samples.at(-1).seconds}`;
+      unstoredBatches.current.set(id, { id, samples });
+    }
+    if (!unstoredBatches.current.size) return;
+    const write = matchQueue.current.then(async () => {
+      const staged = [...unstoredBatches.current.values()];
+      if (!staged.length) return;
+      const existing = new Set(offlineBatches.current.map((batch) => batch.id));
+      const pending = [...offlineBatches.current, ...staged.filter((batch) => !existing.has(batch.id))];
+      await AsyncStorage.setItem(TRAIL_KEY, JSON.stringify({
+        lines: trailRef.current, roadIds: [...knownRoads.current], pending,
+      }));
+      offlineBatches.current = pending;
+      for (const { id } of staged) unstoredBatches.current.delete(id);
+      setPendingMatches(pending.length);
     });
-  }, []);
+    matchQueue.current = write.catch(() => {
+      if (samples[0]?.rideId != null && samples[0].rideId === rideStartedAt.current) rideMatchingFailed.current = true;
+      setMatchingFailed(true);
+    });
+    void matchQueue.current.then(processMatches);
+  }, [processMatches]);
 
   const onLocation = useCallback(
     (loc) => {
@@ -673,9 +739,12 @@ export default function App() {
     if (!trailLoaded || !GEOAPIFY_TEST_KEY) return;
     const timer = setInterval(() => {
       flushSamples(true);
+      void processMatches();
     }, MATCH_INTERVAL_MS);
-    return () => clearInterval(timer);
-  }, [trailLoaded, flushSamples]);
+    void processMatches();
+    const retry = setInterval(() => { void processMatches(); }, 3000);
+    return () => { clearInterval(timer); clearInterval(retry); };
+  }, [trailLoaded, flushSamples, processMatches]);
 
   const startRide = async () => {
     if (ridingRef.current || finishingRideRef.current) return;
@@ -715,6 +784,7 @@ export default function App() {
     setSelectedRide(null);
     lastRecordedTime.current = 0;
     rideUnlocks.current = new Map();
+    appliedRideBatches.current = new Set();
     rideMatchingFailed.current = false;
     rideStartedAt.current = startedAt;
     statsRef.current = { seconds: 0, meters: 0, speed: 0, top: 0 };
@@ -755,7 +825,8 @@ export default function App() {
       line: rideLineRef.current,
       unlockCount: GEOAPIFY_TEST_KEY ? rideUnlocks.current.size : null,
       unlockLines: [...rideUnlocks.current.values()].flat(),
-      unlocksIncomplete: rideMatchingFailed.current,
+      appliedMatchBatches: [...appliedRideBatches.current],
+      unlocksIncomplete: rideMatchingFailed.current || offlineBatches.current.some(({ samples }) => samples[0].rideId === rideStartedAt.current),
     };
     try {
       await updateRides((all) => [summary, ...all.filter((ride) => ride.startedAt !== summary.startedAt)]);
@@ -1232,6 +1303,11 @@ export default function App() {
           </View>
         )}
 
+        {pendingMatches > 0 && (
+          <View style={styles.banner}>
+            <Text style={styles.bannerText}>{matchingFailed ? 'Saved discoveries waiting to retry' : 'Matching saved discoveries…'}</Text>
+          </View>
+        )}
         {locationFailed && (
           <View style={styles.banner}>
             <Text style={styles.bannerText}>GPS unavailable. Check Location Services and reopen the app.</Text>
