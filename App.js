@@ -21,6 +21,7 @@ const TRAIL_KEY = 'trail:matched:v1';
 const MATCH_INTERVAL_MS = 30_000;
 const GEOAPIFY_TEST_KEY = process.env.EXPO_PUBLIC_GEOAPIFY_TEST_KEY?.trim();
 const ROUTES_KEY = 'routes:v1';
+const DISCOVERY_PERMISSION_KEY = 'discovery-permission:v1';
 const QUICK_PLACES_KEY = 'quick-places:v1';
 const RIDES_KEY = 'rides:v1';
 const BACKGROUND_TASK = 'route-runner-ride-location';
@@ -327,6 +328,10 @@ export default function App() {
   const trailRef = useRef([]); // array of line segments
   const lastPtRef = useRef(null);
   const pendingSamples = useRef([]);
+  const discoveryRevision = useRef(0);
+  const discoveryAllowed = useRef(false);
+  const discoveryPrompted = useRef(false);
+  const [discoveryChoice, setDiscoveryChoice] = useState(undefined);
   const matchQueue = useRef(Promise.resolve());
   const [matchingFailed, setMatchingFailed] = useState(false);
   const [trailLoaded, setTrailLoaded] = useState(false);
@@ -487,13 +492,62 @@ export default function App() {
     return write;
   };
 
+  const saveDiscoveryChoice = useCallback(async (allowed) => {
+    discoveryRevision.current += 1;
+    discoveryAllowed.current = allowed;
+    if (!allowed) {
+      pendingSamples.current = [];
+      setMatchingFailed(false);
+    }
+    setDiscoveryChoice(allowed);
+    try {
+      await AsyncStorage.setItem(DISCOVERY_PERMISSION_KEY, allowed ? 'allow' : 'deny');
+    } catch {
+      if (allowed) {
+        discoveryAllowed.current = false;
+        pendingSamples.current = [];
+        setDiscoveryChoice(false);
+      }
+      Alert.alert('Could not save your choice', 'You can try again in Privacy.');
+    }
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    AsyncStorage.getItem(DISCOVERY_PERMISSION_KEY).then((saved) => {
+      if (!active) return;
+      const choice = saved === 'allow' ? true : saved === 'deny' ? false : null;
+      discoveryAllowed.current = choice === true;
+      setDiscoveryChoice(choice);
+    }).catch(() => { if (active) setDiscoveryChoice(null); });
+    return () => { active = false; };
+  }, []);
+
+  const askDiscoveryPermission = useCallback(() => {
+    Alert.alert('Turn on road discovery?',
+      'RouteRunner sends GPS points to Geoapify to identify the roads you travel and unlock them on your map. This can happen while the map is open, even before you start a ride.',
+      [
+        { text: 'Not now', style: 'cancel', onPress: () => { void saveDiscoveryChoice(false); } },
+        { text: 'Allow road discovery', onPress: () => { void saveDiscoveryChoice(true); } },
+      ],
+      { cancelable: false });
+  }, [saveDiscoveryChoice]);
+
+  useEffect(() => {
+    if (!GEOAPIFY_TEST_KEY || permission !== 'granted' || discoveryChoice !== null || discoveryPrompted.current) return;
+    discoveryPrompted.current = true;
+    askDiscoveryPermission();
+  }, [askDiscoveryPermission, discoveryChoice, permission]);
+
   const flushSamples = useCallback((keepLast = false) => {
     const samples = pendingSamples.current;
     pendingSamples.current = keepLast ? samples.slice(-1) : [];
-    if (!GEOAPIFY_TEST_KEY || samples.length < 2) return;
+    if (!discoveryAllowed.current || !GEOAPIFY_TEST_KEY || samples.length < 2) return;
+    const revision = discoveryRevision.current;
 
     const rideId = samples[0].rideId;
     matchQueue.current = matchQueue.current.then(async () => {
+      if (!discoveryAllowed.current || revision !== discoveryRevision.current) return;
       try {
         const matched = await matchRoads(samples);
         if (!matched.length) return;
@@ -530,7 +584,7 @@ export default function App() {
       if (!(accuracy > 0 && accuracy <= 30)) return;
       const pt = [longitude, latitude];
       const recording = ridingRef.current && loc.timestamp >= rideStartedAt.current;
-      if (GEOAPIFY_TEST_KEY) {
+      if (GEOAPIFY_TEST_KEY && discoveryAllowed.current) {
         const seconds = Math.floor(loc.timestamp / 1000);
         const rideId = recording ? rideStartedAt.current : null;
         const last = pendingSamples.current.at(-1);
@@ -753,7 +807,7 @@ export default function App() {
       date,
       seconds: Math.floor((date - rideStartedAt.current) / 1000),
       line: rideLineRef.current,
-      unlockCount: GEOAPIFY_TEST_KEY ? rideUnlocks.current.size : null,
+      unlockCount: GEOAPIFY_TEST_KEY && (discoveryAllowed.current || rideUnlocks.current.size) ? rideUnlocks.current.size : null,
       unlockLines: [...rideUnlocks.current.values()].flat(),
       unlocksIncomplete: rideMatchingFailed.current,
     };
@@ -1269,12 +1323,6 @@ export default function App() {
 
         <View style={{ flex: 1 }} pointerEvents="none" />
 
-        {GEOAPIFY_TEST_KEY && !drawing && (
-          <Text style={styles.discoveryNotice}>
-            Road discovery sends GPS points to Geoapify.
-          </Text>
-        )}
-
         {routePreview && !navigation && (
           <View style={styles.startDirections}>
             {routePreview.loop && <Text style={styles.loopEstimate}>{Math.round(routePreview.seconds / 60)} min estimated loop</Text>}
@@ -1379,7 +1427,7 @@ export default function App() {
       <Modal visible={libraryView !== null} animationType="slide" onRequestClose={closeLibrary}>
         <SafeAreaView style={styles.root}>
           <View style={styles.libraryHeader}>
-            <Text style={styles.libraryTitle}>{shareRide ? 'Share ride' : rideMenu ? rideTitle(rideMenu) : libraryView === 'routes' ? 'Saved routes' : 'Ride history'}</Text>
+            <Text style={styles.libraryTitle}>{shareRide ? 'Share ride' : rideMenu ? rideTitle(rideMenu) : libraryView === 'privacy' ? 'Privacy' : libraryView === 'routes' ? 'Saved routes' : 'Ride history'}</Text>
             <RoundBtn label={shareRide || rideMenu ? "Back" : "Close"} onPress={closeLibrary} />
           </View>
           {shareRide ? <RideShare ride={shareRide} /> : rideMenu ? (
@@ -1390,7 +1438,18 @@ export default function App() {
             </View>
           ) : (
           <ScrollView contentContainerStyle={styles.libraryList}>
-            {libraryView === 'routes' ? (
+            {libraryView === 'privacy' ? (
+              <View style={styles.libraryRow}>
+                <Text style={styles.rowTitle}>Road discovery</Text>
+                <Text style={styles.rowDetail}>When enabled, GPS points are sent to Geoapify to match the roads you travel. RouteRunner stores unlocked roads and ride history on this device.</Text>
+                <Text style={styles.rowDetail}>Destination searches and directions also use Geoapify to look up places and calculate routes when you request them.</Text>
+                {GEOAPIFY_TEST_KEY && (
+                  <Pill label={discoveryChoice ? 'Turn off road discovery' : 'Allow road discovery'}
+                    disabled={discoveryChoice === undefined}
+                    onPress={() => discoveryChoice ? saveDiscoveryChoice(false) : askDiscoveryPermission()} />
+                )}
+              </View>
+            ) : libraryView === 'routes' ? (
               routes.length ? routes.map((route) => (
                 <View key={route.id} style={styles.libraryRow}>
                   <Text style={styles.rowTitle}>{route.name}</Text>
@@ -1407,7 +1466,10 @@ export default function App() {
                 </View>
               )) : <Text style={styles.rowDetail}>No saved routes yet. Use Where to? on the map to plan one.</Text>
             ) : (
-              <RideHistory rides={rides} onOpen={openRide} onMenu={setRideMenu} />
+              <>
+                <RideHistory rides={rides} onOpen={openRide} onMenu={setRideMenu} />
+                <Pill label="Privacy" onPress={() => setLibraryView('privacy')} />
+              </>
             )}
           </ScrollView>
           )}
@@ -1789,7 +1851,6 @@ const styles = StyleSheet.create({
   exploreActions: { flexDirection: 'row', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8, paddingVertical: 5 },
   loopEstimate: { color: "#fff", textAlign: "center", marginBottom: 6, backgroundColor: PANEL },
   startDirections: { alignSelf: 'center', marginBottom: 8 },
-  discoveryNotice: { color: "#d2d2d8", backgroundColor: PANEL, alignSelf: "center", padding: 6, borderRadius: 8, marginBottom: 6, fontSize: 11 },
   mapSearch: { marginHorizontal: 16, marginBottom: 10, padding: 15, borderRadius: 16, backgroundColor: PANEL, borderWidth: 1, borderColor: '#555' },
   mapSearchText: { color: '#fff', fontSize: 18, fontWeight: '700' },
   bottomRow: {
