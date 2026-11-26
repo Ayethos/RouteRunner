@@ -176,6 +176,21 @@ function routeOffsets(lines) {
   }));
 }
 
+function remainingRouteLines(lines, offsets, progress) {
+  return lines.flatMap((line, leg) => {
+    const legOffsets = offsets[leg];
+    if (progress >= legOffsets.at(-1)) return [];
+    if (progress <= legOffsets[0]) return [line];
+    const next = legOffsets.findIndex((meters) => meters > progress);
+    const [lon, lat] = line[next - 1];
+    const [nextLon, nextLat] = line[next];
+    const share = (progress - legOffsets[next - 1]) / (legOffsets[next] - legOffsets[next - 1]);
+    const deltaLon = ((nextLon - lon + 540) % 360) - 180;
+    const start = [((lon + deltaLon * share + 540) % 360) - 180, lat + (nextLat - lat) * share];
+    return [[start, ...line.slice(next)]];
+  });
+}
+
 function locateOnRoute(point, lines, offsets, previous) {
   const lonScale = 111_195 * Math.cos(toRad(point[1]));
   const project = ([lon, lat]) => [
@@ -505,13 +520,17 @@ function RouteRunner({ openAccount }) {
       }
       if (offRoute || rerouting) return;
       setRerouteStatus(null);
+      if (fixOnRoute.meters >= progress || progress - fixOnRoute.meters >= 9) {
+        progress = fixOnRoute.meters;
+      }
+      const nextProgress = progress;
       setNavigation((state) => {
         if (!state || state.lines !== activeLines || state.arrived) return state;
-        progress = Math.max(progress, fixOnRoute.meters);
         let index = state.index;
-        while (index < state.steps.length - 1 && progress >= state.steps[index].meters + 8) index += 1;
-        const reached = progress >= state.totalMeters - 25 && distM(point, state.lines.at(-1).at(-1)) <= 30;
-        return { ...state, progress, index, arrived: reached };
+        while (index > 0 && nextProgress < state.steps[index - 1].meters - 20) index -= 1;
+        while (index < state.steps.length - 1 && nextProgress >= state.steps[index].meters + 8) index += 1;
+        const reached = nextProgress >= state.totalMeters - 25 && distM(point, state.lines.at(-1).at(-1)) <= 30;
+        return { ...state, progress: nextProgress, index, arrived: reached };
       });
     }, 1000);
     return () => {
@@ -1349,8 +1368,9 @@ function RouteRunner({ openAccount }) {
           </MapLibreGL.ShapeSource>
         )}
 
-        {navigation && (
-          <MapLibreGL.ShapeSource id="navigation-route" shape={fc(navigation.lines)}>
+        {navigation && !navigation.arrived && (
+          <MapLibreGL.ShapeSource id="navigation-route"
+            shape={fc(remainingRouteLines(navigation.lines, navigation.offsets, navigation.progress))}>
             <MapLibreGL.LineLayer id="navigation-core" style={{ ...pinkLayerStyle.core, lineWidth: 6 }} />
           </MapLibreGL.ShapeSource>
         )}
