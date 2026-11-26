@@ -21,6 +21,7 @@ const TRAIL_KEY = 'trail:matched:v1';
 const MATCH_INTERVAL_MS = 30_000;
 const GEOAPIFY_TEST_KEY = process.env.EXPO_PUBLIC_GEOAPIFY_TEST_KEY?.trim();
 const ROUTES_KEY = 'routes:v1';
+const QUICK_PLACES_KEY = 'quick-places:v1';
 const RIDES_KEY = 'rides:v1';
 const BACKGROUND_TASK = 'route-runner-ride-location';
 const ACTIVE_RIDE_KEY = 'active-ride:v1';
@@ -369,6 +370,10 @@ export default function App() {
   const [originNeedsSelection, setOriginNeedsSelection] = useState(false);
   const [destination, setDestination] = useState(null);
   const [routePreview, setRoutePreview] = useState(null);
+  const [quickPlaces, setQuickPlaces] = useState({});
+  const [editingShortcut, setEditingShortcut] = useState(null);
+  const shortcutWrite = useRef(false);
+  const [savingShortcut, setSavingShortcut] = useState(false);
   const currentPoint = useRef(null);
   const [searchNear, setSearchNear] = useState(null);
   const [navigation, setNavigation] = useState(null);
@@ -444,6 +449,12 @@ export default function App() {
   useEffect(() => {
     AsyncStorage.getItem(RIDES_KEY).then((saved) => {
       if (saved) setRides(JSON.parse(saved));
+    }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    AsyncStorage.getItem(QUICK_PLACES_KEY).then((raw) => {
+      if (raw) setQuickPlaces(JSON.parse(raw));
     }).catch(() => {});
   }, []);
 
@@ -766,13 +777,13 @@ export default function App() {
     setDraft((points) => points.length < 12 ? [...points, point] : points);
   };
 
-  const previewAddressRoute = async () => {
-    if (savingRouteRef.current || !destination || originNeedsSelection) return;
+  const previewAddressRoute = async (place = destination, fromCurrent = false) => {
+    if (savingRouteRef.current || !place || (!fromCurrent && originNeedsSelection)) return;
     if (!GEOAPIFY_TEST_KEY) {
       Alert.alert('Route planning unavailable', 'This build needs a Geoapify key.');
       return;
     }
-    const start = origin?.point ?? currentPoint.current;
+    const start = (fromCurrent ? null : origin?.point) ?? currentPoint.current;
     if (!start) {
       Alert.alert('Current location unavailable', 'Wait for a GPS fix or search for a starting point.');
       return;
@@ -780,12 +791,19 @@ export default function App() {
     savingRouteRef.current = true;
     setSavingRoute(true);
     try {
-      const { lines } = await planRoadRoute([start, destination.point]);
+      const { lines } = await planRoadRoute([start, place.point]);
       if (!lines.length) {
         Alert.alert('No driving route found', 'Try a different start or destination.');
         return;
       }
-      setRoutePreview({ name: destination.label, lines, waypoints: [start, destination.point] });
+      if (fromCurrent) {
+        setOrigin(null);
+        setOriginNeedsSelection(false);
+        setOriginReset((value) => value + 1);
+        setDestination(place);
+      }
+      setRoutePreview({ name: place.label, lines, waypoints: [start, place.point] });
+      setNavigation(null);
       setSelectedRide(null);
       setAddressPlanner(false);
       showOnMap(lines);
@@ -797,8 +815,27 @@ export default function App() {
     }
   };
 
+  const saveShortcut = async (place) => {
+    if (!editingShortcut || shortcutWrite.current) return;
+    shortcutWrite.current = true;
+    setSavingShortcut(true);
+    try {
+      const next = { ...quickPlaces };
+      if (place) next[editingShortcut] = place;
+      else delete next[editingShortcut];
+      await AsyncStorage.setItem(QUICK_PLACES_KEY, JSON.stringify(next));
+      setQuickPlaces(next);
+      setEditingShortcut(null);
+    } catch {
+      Alert.alert('Could not update shortcut', 'Try again.');
+    } finally {
+      shortcutWrite.current = false;
+      setSavingShortcut(false);
+    }
+  };
+
   const saveAddressRoute = async () => {
-    if (!routePreview || savingRouteRef.current) return;
+    if (!routePreview || routePreview.id || savingRouteRef.current) return;
     savingRouteRef.current = true;
     setSavingRoute(true);
     try {
@@ -947,6 +984,7 @@ export default function App() {
           const next = routes.filter(({ id }) => id !== route.id);
           await AsyncStorage.setItem(ROUTES_KEY, JSON.stringify(next));
           setRoutes(next);
+          setRoutePreview((preview) => preview?.id === route.id ? null : preview);
         } catch {
           Alert.alert('Could not delete route', 'Try again.');
         } finally {
@@ -1067,12 +1105,6 @@ export default function App() {
               style={{ ...pinkLayerStyle.core, lineColor: color, lineWidth: minutes === 90 ? 8 : minutes === 60 ? 6 : 4 }} />
           </MapLibreGL.ShapeSource>
         ))}
-
-        {/* Saved routes: neon pink */}
-        {!explore && <MapLibreGL.ShapeSource id="routes" shape={fc(routes.flatMap((route) => route.lines ?? [route.line]))}>
-          <MapLibreGL.LineLayer id="routes-glow" style={pinkLayerStyle.glow} />
-          <MapLibreGL.LineLayer id="routes-core" style={pinkLayerStyle.core} />
-        </MapLibreGL.ShapeSource>}
 
         {selectedRide && (
           <MapLibreGL.ShapeSource id="recorded-ride" shape={fc(selectedRide.lines)}>
@@ -1260,9 +1292,9 @@ export default function App() {
         <View style={styles.bottomRow} pointerEvents="box-none">
           {routePreview && !navigation ? (
             <>
-              <Pill label={routePreview.loop ? "All loops" : "Edit"} disabled={savingRoute} onPress={routePreview.loop ? () => { setRoutePreview(null); showOnMap(exploreLoops.flatMap(({ route }) => route.lines)); } : openPlanner} />
+              {!routePreview.id && <Pill label={routePreview.loop ? "All loops" : "Edit"} disabled={savingRoute} onPress={routePreview.loop ? () => { setRoutePreview(null); showOnMap(exploreLoops.flatMap(({ route }) => route.lines)); } : openPlanner} />}
               <Pill label="Close" disabled={savingRoute} onPress={() => setRoutePreview(null)} />
-              <Pill label="Save route" primary disabled={savingRoute} onPress={saveAddressRoute} />
+              {!routePreview.id && <Pill label="Save route" primary disabled={savingRoute} onPress={saveAddressRoute} />}
             </>
           ) : drawing ? (
             <>
@@ -1286,14 +1318,45 @@ export default function App() {
         )}
       </SafeAreaView>
       <Modal visible={addressPlanner} animationType="slide" onRequestClose={() => {
-        if (!savingRoute) setAddressPlanner(false);
+        if (!savingRoute && !savingShortcut) { setEditingShortcut(null); setAddressPlanner(false); }
       }}>
         <SafeAreaView style={styles.root}>
           <View style={styles.libraryHeader}>
             <Text style={styles.libraryTitle}>Plan a route</Text>
-            <Pill label="Close" disabled={savingRoute} onPress={() => setAddressPlanner(false)} />
+            <Pill label={editingShortcut ? "Back" : "Close"} disabled={savingRoute || savingShortcut} onPress={() => {
+              if (editingShortcut) setEditingShortcut(null);
+              else setAddressPlanner(false);
+            }} />
           </View>
           <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.libraryList}>
+            {editingShortcut ? (
+              <>
+                <PlaceSearch key={editingShortcut} autoFocus nearbyFirst near={searchNear}
+                  title={`Set ${editingShortcut}`} placeholder="Search address or place"
+                  selected={null} disabled={savingShortcut} onSelect={saveShortcut} />
+                {quickPlaces[editingShortcut] && <Pill label={`Remove ${editingShortcut}`}
+                  disabled={savingShortcut} onPress={() => saveShortcut(null)} />}
+              </>
+            ) : (
+              <>
+                <View style={styles.quickPlaces}>
+                  {['Home', 'Work'].map((label) => {
+                    const place = quickPlaces[label];
+                    return (
+                      <View key={label} style={[styles.libraryRow, styles.quickPlace]}>
+                        <Pressable accessibilityRole="button" disabled={savingRoute}
+                          onPress={() => place ? previewAddressRoute(place, true) : setEditingShortcut(label)}>
+                          <Text style={styles.rowTitle}>{place ? label : `Set ${label}`}</Text>
+                          {place && <Text numberOfLines={1} style={styles.rowDetail}>{place.label}</Text>}
+                        </Pressable>
+                        {place && <Pressable accessibilityRole="button" accessibilityLabel={`Change ${label}`}
+                          disabled={savingRoute} onPress={() => setEditingShortcut(label)} style={styles.retryButton}>
+                          <Text style={styles.retryText}>Change</Text>
+                        </Pressable>}
+                      </View>
+                    );
+                  })}
+                </View>
             <PlaceSearch key={originReset} near={searchNear} title="From" placeholder="Current location" selected={origin}
               onSelect={(place) => { setOrigin(place); setOriginNeedsSelection(false); }}
               onEdit={(value) => setOriginNeedsSelection(Boolean(value.trim()))} disabled={savingRoute} />
@@ -1301,13 +1364,15 @@ export default function App() {
             <PlaceSearch autoFocus nearbyFirst near={origin?.point ?? searchNear} title="To" placeholder="Search address or place" selected={destination}
               onSelect={setDestination} disabled={savingRoute} />
             <Pill label={savingRoute ? "Finding roads…" : "Show route"} primary
-              disabled={!destination || originNeedsSelection || savingRoute} onPress={previewAddressRoute} />
+              disabled={!destination || originNeedsSelection || savingRoute} onPress={() => previewAddressRoute()} />
             <Pill label="Pick points on map" disabled={savingRoute} onPress={() => {
               setAddressPlanner(false);
               setRoutePreview(null);
               setDrawing(true);
               setFollow(false);
             }} />
+              </>
+            )}
           </ScrollView>
         </SafeAreaView>
       </Modal>
@@ -1330,7 +1395,7 @@ export default function App() {
                 <View key={route.id} style={styles.libraryRow}>
                   <Text style={styles.rowTitle}>{route.name}</Text>
                   <Pressable accessibilityRole="button" disabled={savingRoute} style={styles.placeResult}
-                    onPress={() => { setSelectedRide(null); setNavigation(null); setExplore(false); showOnMap(route.lines ?? [route.line]); }}>
+                    onPress={() => { setSelectedRide(null); setNavigation(null); setExplore(false); setRoutePreview({ ...route, lines: route.lines ?? [route.line] }); showOnMap(route.lines ?? [route.line]); }}>
                     <Text style={styles.rowDetail}>Show on map</Text>
                   </Pressable>
                   <Pressable accessibilityRole="button" disabled={savingRoute} style={styles.placeResult} onPress={() => startDirections(route)}>
@@ -1789,6 +1854,8 @@ const styles = StyleSheet.create({
   shareStats: { alignItems: 'center', gap: 4, paddingBottom: 14 },
   shareMetric: { color: '#fff', fontSize: 25, fontWeight: '800', backgroundColor: '#141416', paddingHorizontal: 8 },
   shareSpeed: { color: '#fff', fontSize: 14, fontWeight: '700', backgroundColor: '#141416', paddingHorizontal: 8 },
+  quickPlaces: { flexDirection: 'row', gap: 8 },
+  quickPlace: { flex: 1, minWidth: 0 },
   libraryList: { padding: 16, gap: 10 },
   libraryRow: { padding: 16, borderRadius: 14, backgroundColor: PANEL, gap: 5 },
   navigationPanel: { margin: 12, paddingHorizontal: 16, paddingTop: 12, backgroundColor: '#141416', borderRadius: 20 },
