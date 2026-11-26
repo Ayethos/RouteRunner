@@ -316,6 +316,10 @@ const exploreShade = {
 // ---- App -----------------------------------------------------------------
 export default function App() {
   const cameraRef = useRef(null);
+  const startupCameraPending = useRef(true);
+  const [startupLocation, setStartupLocation] = useState(null);
+  const [hasLiveLocation, setHasLiveLocation] = useState(false);
+  const [locatingStartup, setLocatingStartup] = useState(true);
   const knownRoads = useRef(new Set());
   const rideUnlocks = useRef(new Map());
   const rideMatchingFailed = useRef(false);
@@ -552,6 +556,11 @@ export default function App() {
     [flushSamples]
   );
 
+  useEffect(() => {
+    const timeout = setTimeout(() => setLocatingStartup(false), 5000);
+    return () => clearTimeout(timeout);
+  }, []);
+
   // location watcher
   useEffect(() => {
     if (!trailLoaded) return;
@@ -562,11 +571,34 @@ export default function App() {
         const { status } = await Location.requestForegroundPermissionsAsync();
         if (!active) return;
         setPermission(status);
-        if (status !== 'granted') return;
+        if (status !== 'granted') {
+          setLocatingStartup(false);
+          return;
+        }
+        Location.getLastKnownPositionAsync({ maxAge: 86_400_000, requiredAccuracy: 1000 })
+          .then((cached) => {
+            if (!active || !cached || !startupCameraPending.current) return;
+            const centerCoordinate = [cached.coords.longitude, cached.coords.latitude];
+            setStartupLocation(centerCoordinate);
+            cameraRef.current?.setCamera({ centerCoordinate, zoomLevel: 13, animationDuration: 0 });
+            setLocatingStartup(false);
+          }).catch(() => {});
         sub = await Location.watchPositionAsync(
           { accuracy: Location.Accuracy.BestForNavigation, distanceInterval: 5, timeInterval: 1000 },
           (location) => {
+            if (!active) return;
+            const firstFix = currentPoint.current === null;
             currentPoint.current = [location.coords.longitude, location.coords.latitude];
+            if (firstFix) {
+              if (startupCameraPending.current) {
+                cameraRef.current?.setCamera({
+                  centerCoordinate: currentPoint.current, zoomLevel: 15, animationDuration: 0,
+                });
+              }
+              startupCameraPending.current = false;
+              setHasLiveLocation(true);
+              setLocatingStartup(false);
+            }
             const { accuracy } = location.coords;
             if (accuracy > 0 && accuracy <= 35) {
               navigationFix.current = { point: currentPoint.current, accuracy, timestamp: location.timestamp };
@@ -577,7 +609,10 @@ export default function App() {
         );
         if (!active) sub.remove();
       } catch {
-        if (active) setLocationFailed(true);
+        if (active) {
+          setLocationFailed(true);
+          setLocatingStartup(false);
+        }
       }
     })();
     return () => {
@@ -815,6 +850,7 @@ export default function App() {
       east: Math.max(box.east, lon),
       north: Math.max(box.north, lat),
     }), { west: Infinity, south: Infinity, east: -Infinity, north: -Infinity });
+    startupCameraPending.current = false;
     setFollow(false);
     setLibraryView(null);
     requestAnimationFrame(() => {
@@ -982,15 +1018,19 @@ export default function App() {
         compassEnabled={false}
         onPress={onMapPress}
         onRegionWillChange={(f) => {
-          if (f?.properties?.isUserInteraction) setFollow(false);
+          if (f?.properties?.isUserInteraction) {
+            startupCameraPending.current = false;
+            setLocatingStartup(false);
+            setFollow(false);
+          }
         }}
       >
         <MapLibreGL.Camera
           ref={cameraRef}
-          followUserLocation={follow}
+          followUserLocation={follow && hasLiveLocation}
           followUserMode="normal"
           followZoomLevel={15}
-          defaultSettings={{ centerCoordinate: [0, 20], zoomLevel: 2 }}
+          defaultSettings={{ centerCoordinate: startupLocation ?? [0, 0], zoomLevel: startupLocation ? 13 : 0 }}
         />
         <MapLibreGL.UserLocation visible renderMode="native" showsUserHeadingIndicator androidRenderMode="compass" />
 
@@ -1142,6 +1182,11 @@ export default function App() {
 
         {navigation && (
           <NavigationPanel navigation={navigation} rerouteStatus={rerouteStatus} onEnd={() => setNavigation(null)} />
+        )}
+        {locatingStartup && !mapFailed && (
+          <View style={styles.banner}>
+            <Text style={styles.bannerText}>Finding your location…</Text>
+          </View>
         )}
         {mapFailed && (
           <View style={styles.banner}>
