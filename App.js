@@ -397,6 +397,7 @@ export default function App() {
   const [simplifiedStyleFailed, setSimplifiedStyleFailed] = useState(false);
   const [styleAttempt, setStyleAttempt] = useState(0);
   const [rideMenu, setRideMenu] = useState(null);
+  const [recapRide, setRecapRide] = useState(null);
   const [shareRide, setShareRide] = useState(null);
   const [explore, setExplore] = useState(false);
   const [exploreLoops, setExploreLoops] = useState([]);
@@ -1175,6 +1176,7 @@ export default function App() {
   const closeLibrary = () => {
     if (shareRide) setShareRide(null);
     else if (rideMenu) setRideMenu(null);
+    else if (recapRide) setRecapRide(null);
     else if (libraryView === 'privacy') setLibraryView('settings');
     else if (libraryView !== 'menu') setLibraryView('menu');
     else setLibraryView(null);
@@ -1186,6 +1188,7 @@ export default function App() {
       Alert.alert('No recorded path', 'This ride has too few connected GPS points to show on the map.');
       return;
     }
+    setRecapRide(null);
     setSelectedRide({ ...ride, lines });
     showOnMap(lines);
   };
@@ -1552,7 +1555,7 @@ export default function App() {
         ) : (
         <SafeAreaView style={styles.root}>
           <View style={styles.libraryHeader}>
-            <Text style={styles.libraryTitle}>{shareRide ? 'Share ride' : rideMenu ? rideTitle(rideMenu) : libraryView === 'privacy' ? 'Privacy' : libraryView === 'settings' ? 'Settings' : libraryView === 'account' ? 'Account' : libraryView === 'routes' ? 'Saved routes' : 'Ride history'}</Text>
+            <Text style={styles.libraryTitle}>{shareRide ? 'Share ride' : rideMenu ? rideTitle(rideMenu) : recapRide ? 'Ride recap' : libraryView === 'privacy' ? 'Privacy' : libraryView === 'settings' ? 'Settings' : libraryView === 'account' ? 'Account' : libraryView === 'routes' ? 'Saved routes' : 'Ride history'}</Text>
             <RoundBtn label="Back" onPress={closeLibrary} />
           </View>
           {shareRide ? <RideShare ride={shareRide} /> : rideMenu ? (
@@ -1561,6 +1564,8 @@ export default function App() {
               <Pill label="Share ride" onPress={() => { setShareRide(rideMenu); setRideMenu(null); }} />
               <Pill label="Delete ride" onPress={() => { deleteRide(rideMenu); setRideMenu(null); }} />
             </View>
+          ) : recapRide ? (
+            <RideRecap ride={recapRide} onReplay={() => openRide(recapRide)} onShare={() => setShareRide(recapRide)} />
           ) : (
           <ScrollView contentContainerStyle={styles.libraryList}>
             {libraryView === 'settings' ? (
@@ -1610,7 +1615,7 @@ export default function App() {
                 </View>
               )) : <Text style={styles.rowDetail}>No saved routes yet. Use Where to? on the map to plan one.</Text>
             ) : (
-              <RideHistory rides={rides} onOpen={openRide} onMenu={setRideMenu} />
+              <RideHistory rides={rides} onOpen={setRecapRide} onMenu={setRideMenu} />
             )}
           </ScrollView>
           )}
@@ -1838,9 +1843,9 @@ function rideArtwork(ride) {
     `${160 + (x - bounds.left - width / 2) * scale},${122 + (y - bounds.top - height / 2) * scale}`).join(' '));
 }
 
-function RideLine({ paths, thumbnail = false, withPhoto = false }) {
+function RideLine({ paths, thumbnail = false, withPhoto = false, height = '66%' }) {
   return (
-    <Svg width={thumbnail ? 78 : '100%'} height={thumbnail ? 68 : '66%'} viewBox="0 0 320 244">
+    <Svg width={thumbnail ? 78 : '100%'} height={thumbnail ? 68 : height} viewBox="0 0 320 244">
       {paths.map((points, index) => (
         <React.Fragment key={index}>
           <Polyline points={points} fill="none" stroke={withPhoto ? '#141416' : '#fff'}
@@ -1850,6 +1855,55 @@ function RideLine({ paths, thumbnail = false, withPhoto = false }) {
         </React.Fragment>
       ))}
     </Svg>
+  );
+}
+
+function RideRecap({ ride, onReplay, onShare }) {
+  const paths = React.useMemo(() => rideArtwork(ride), [ride]);
+  const hasDistance = Number.isFinite(ride.meters);
+  const hasDuration = Number.isFinite(ride.seconds);
+  const top = Number.isFinite(ride.top) ? formatSpeed(ride.top) : 'Unavailable';
+  const average = hasDistance && hasDuration && ride.seconds > 0 ? formatSpeed(averageSpeed(ride)) : 'Unavailable';
+  const metrics = [
+    ['Distance', hasDistance ? formatDistance(ride.meters) : 'Unavailable'],
+    ['Duration', hasDuration ? fmtTime(ride.seconds) : 'Unavailable'],
+    ['Average speed', average],
+    ['Top speed', top],
+  ];
+
+  return (
+    <ScrollView contentContainerStyle={styles.recap}>
+      <View style={styles.recapHero}>
+        <View style={styles.recapHeroHeader}>
+          <Text accessibilityRole="header" style={styles.recapTitle}>{rideTitle(ride)}</Text>
+          <Text style={styles.rowDetail}>
+            {new Date(ride.startedAt ?? ride.date).toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' })}
+          </Text>
+        </View>
+        {paths.length > 0 ? (
+          <View style={styles.recapTrace}><RideLine paths={paths} height="100%" /></View>
+        ) : <Text style={styles.rowDetail}>No connected GPS path was saved for this ride.</Text>}
+      </View>
+      <View style={styles.recapMetrics}>
+        {metrics.map(([label, value]) => (
+          <View key={label} style={styles.recapStat}>
+            <Text style={styles.recapStatLabel}>{label}</Text>
+            <Text style={styles.recapStatValue} adjustsFontSizeToFit numberOfLines={1}>{value}</Text>
+          </View>
+        ))}
+      </View>
+      {ride.unlockCount != null && (
+        <View style={styles.recapUnlock}>
+          <Text style={styles.recapUnlockValue}>{ride.unlockCount > 0 ? '+' : ''}{ride.unlockCount}</Text>
+          <View style={styles.recapUnlockLabel}>
+            <Text style={styles.rowTitle}>New roads unlocked</Text>
+            {ride.unlocksIncomplete && <Text style={styles.rowDetail}>Partial matching results</Text>}
+          </View>
+        </View>
+      )}
+      {paths.length > 0 && <Pill label="Replay on map" primary onPress={onReplay} />}
+      <Pill label="Share ride" onPress={onShare} />
+    </ScrollView>
   );
 }
 
@@ -2052,6 +2106,18 @@ const styles = StyleSheet.create({
     padding: 16,
   },
   libraryTitle: { color: '#fff', fontSize: 25, fontWeight: '700' },
+  recap: { padding: 16, gap: 14 },
+  recapHero: { padding: 16, borderRadius: 20, borderWidth: 1, borderColor: '#4f2640', backgroundColor: '#20131e', gap: 8 },
+  recapHeroHeader: { gap: 4 },
+  recapTitle: { color: '#fff', fontWeight: '800', fontSize: 30 },
+  recapTrace: { height: 160, justifyContent: 'center' },
+  recapMetrics: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', rowGap: 9 },
+  recapStat: { width: '48.5%', borderRadius: 15, backgroundColor: '#222227', padding: 14, gap: 5 },
+  recapStatLabel: { color: '#b9b9c0', fontSize: 13, fontWeight: '700' },
+  recapStatValue: { color: '#fff', fontSize: 27, fontWeight: '800', fontVariant: ['tabular-nums'] },
+  recapUnlock: { flexDirection: 'row', alignItems: 'center', gap: 14, padding: 14, borderRadius: 15, backgroundColor: '#142c23' },
+  recapUnlockValue: { color: '#77F2AE', fontWeight: '800', fontSize: 32 },
+  recapUnlockLabel: { flex: 1, gap: 4 },
   historySection: { gap: 9, marginTop: 8 },
   historyHeading: { color: '#e6e6ea', fontSize: 16, fontWeight: '800', marginTop: 4 },
   historyCard: { padding: 14, flexDirection: 'row', alignItems: 'center', gap: 10, borderRadius: 16, backgroundColor: '#222227' },
