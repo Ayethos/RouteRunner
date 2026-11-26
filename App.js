@@ -7,7 +7,7 @@ import { useKeepAwake } from 'expo-keep-awake';
 import * as TaskManager from 'expo-task-manager';
 import * as ImagePicker from 'expo-image-picker';
 import * as Sharing from 'expo-sharing';
-import Svg, { Polyline } from 'react-native-svg';
+import Svg, { Circle, Polyline } from 'react-native-svg';
 import { captureRef, releaseCapture } from 'react-native-view-shot';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import MapLibreGL from '@maplibre/maplibre-react-native';
@@ -1523,7 +1523,6 @@ function RouteRunner({ openAccount }) {
           <View style={styles.statsBar}>
             <Stat label="Time" value={fmtTime(stats.seconds)} />
             <Stat label="Distance" value={formatDistance(stats.meters)} />
-            <Stat label="Speed" value={formatSpeed(stats.speed)} />
             <Stat label="Average" value={formatSpeed(averageSpeed(stats))} />
             <Stat label="Top" value={formatSpeed(stats.top)} />
           </View>
@@ -1544,6 +1543,11 @@ function RouteRunner({ openAccount }) {
             <Text style={styles.mapSearchText}>⌕   Where to?</Text>
           </Pressable>
         )}
+        {riding && (drawing || (routePreview && !navigation)) && (
+          <View style={styles.speedometerStandalone} pointerEvents="none">
+            <RideSpeedometer speed={stats.speed} />
+          </View>
+        )}
         {/* Bottom controls */}
         <View style={styles.bottomRow} pointerEvents="box-none">
           {routePreview && !navigation ? (
@@ -1558,9 +1562,19 @@ function RouteRunner({ openAccount }) {
               <Pill label="Undo" disabled={savingRoute || !draft.length} onPress={() => setDraft((d) => d.slice(0, -1))} />
               <Pill label={savingRoute ? "Finding roads…" : "Save route"} primary disabled={savingRoute || draft.length < 2} onPress={saveRoute} />
             </>
+          ) : riding ? (
+            <>
+              <View style={styles.speedometerSideLeft}>
+                <RoundBtn label="End ride" onPress={endRide} />
+              </View>
+              <RideSpeedometer speed={stats.speed} />
+              <View style={styles.speedometerSideRight}>
+                <RoundBtn label="Locate" active={follow} onPress={() => setFollow(true)} />
+              </View>
+            </>
           ) : (
             <>
-              <Pill label={riding ? 'End ride' : 'Start ride'} primary onPress={riding ? endRide : startRide} />
+              <Pill label="Start ride" primary onPress={startRide} />
               <RoundBtn
                 label="Locate"
                 active={follow}
@@ -2135,6 +2149,33 @@ function Pill({ label, onPress, primary, disabled = false }) {
     </Pressable>
   );
 }
+function speedometerReading(metersPerSecond) {
+  const speed = Math.max(0, (Number.isFinite(metersPerSecond) ? metersPerSecond : 0) * (useMiles ? 2.236936 : 3.6));
+  const dialMax = useMiles ? 90 : 140;
+  return { speed: Math.round(speed), fill: Math.min(1, speed / dialMax) };
+}
+
+function RideSpeedometer({ speed: metersPerSecond }) {
+  const { speed, fill } = speedometerReading(metersPerSecond);
+  const radius = 49;
+  const circumference = 2 * Math.PI * radius;
+  const arc = circumference * 0.75;
+  return (
+    <View style={styles.speedometer} accessible accessibilityLabel={`Current speed ${speed} ${useMiles ? 'miles per hour' : 'kilometres per hour'}`}>
+      <Svg width="100%" height="100%" viewBox="0 0 120 120" style={StyleSheet.absoluteFill} accessible={false}>
+        <Circle cx={60} cy={60} r={radius} stroke="#49414c" strokeWidth={7} fill="none"
+          strokeLinecap="round" strokeDasharray={[arc, circumference]} rotation={135} originX={60} originY={60} />
+        {fill > 0 && (
+          <Circle cx={60} cy={60} r={radius} stroke={PINK} strokeWidth={7} fill="none"
+            strokeLinecap="round" strokeDasharray={[arc * fill, circumference]} rotation={135} originX={60} originY={60} />
+        )}
+      </Svg>
+      <Text style={styles.speedometerValue} numberOfLines={1} adjustsFontSizeToFit>{speed}</Text>
+      <Text style={styles.speedometerUnit}>{speedUnit}</Text>
+    </View>
+  );
+}
+
 function Stat({ label, value }) {
   return (
     <View style={{ alignItems: 'center', flex: 1 }}>
@@ -2157,6 +2198,12 @@ const styles = StyleSheet.create({
   startDirections: { alignSelf: 'center', marginBottom: 8 },
   mapSearch: { marginHorizontal: 16, marginBottom: 10, padding: 15, borderRadius: 16, backgroundColor: PANEL, borderWidth: 1, borderColor: '#555' },
   mapSearchText: { color: '#fff', fontSize: 18, fontWeight: '700' },
+  speedometer: { width: 120, height: 120, borderRadius: 60, backgroundColor: '#17141b', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 18, flexShrink: 0 },
+  speedometerValue: { color: '#fff', fontSize: 41, fontWeight: '800', lineHeight: 47, fontVariant: ['tabular-nums'] },
+  speedometerUnit: { color: '#e2c3d5', fontSize: 13, fontWeight: '700' },
+  speedometerStandalone: { alignSelf: 'center', marginBottom: 8 },
+  speedometerSideLeft: { flex: 1, alignItems: 'flex-start' },
+  speedometerSideRight: { flex: 1, alignItems: 'flex-end' },
   bottomRow: {
     flexDirection: 'row',
     alignItems: 'center',
