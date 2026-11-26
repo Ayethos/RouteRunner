@@ -1307,25 +1307,37 @@ export default function App() {
   );
 }
 
+function searchName(text) {
+  return text.toLowerCase().normalize('NFKD').replace(/[^\p{L}\p{N}]/gu, '');
+}
+
 async function searchPlaces(query, near, signal, nearbyFirst) {
+  const name = searchName(query);
+  const isMcDonalds = name === 'mcdonald' || name === 'mcdonalds';
+  const lookup = isMcDonalds ? "McDonald's" : query.replace(/’/g, "'");
   const bias = near ? `&bias=${encodeURIComponent(`proximity:${near.join(',')}`)}` : '';
-  const params = `text=${encodeURIComponent(query)}&format=json&limit=8${bias}&apiKey=${encodeURIComponent(GEOAPIFY_TEST_KEY)}`;
+  const key = encodeURIComponent(GEOAPIFY_TEST_KEY);
   const fetchPlaces = async (filter = '') => {
+    const params = `text=${encodeURIComponent(lookup)}&format=json&limit=8${bias}&apiKey=${key}`;
     const response = await fetch(`https://api.geoapify.com/v1/geocode/autocomplete?${params}${filter}`, { signal });
     if (!response.ok) throw new Error('Place search failed');
     const result = await response.json();
-    return (result.results ?? [])
-      .filter(({ formatted, lon, lat }) => formatted && Number.isFinite(lon) && Number.isFinite(lat))
-      .map(({ formatted, lon, lat }) => ({ label: formatted, point: [lon, lat] }));
+    return (result.results ?? []).flatMap(({ formatted, lon, lat, name: placeName, result_type }) => {
+      if (!formatted || !Number.isFinite(lon) || !Number.isFinite(lat)) return [];
+      const namedBusiness = result_type === 'amenity' && placeName;
+      if (isMcDonalds && (!namedBusiness || searchName(placeName) !== 'mcdonalds')) return [];
+      return [{ label: formatted, point: [lon, lat], businessName: namedBusiness || null }];
+    });
   };
 
-  if (near && nearbyFirst) {
-    const circle = encodeURIComponent(`circle:${near.join(',')},15000`);
+  if (near && (nearbyFirst || isMcDonalds)) {
+    const radius = nearbyFirst ? 15000 : 50000;
+    const circle = encodeURIComponent(`circle:${near.join(',')},${radius}`);
     const localFilter = `&filter=${circle}`;
     const queries = [fetchPlaces(localFilter)];
     if (!/^\d+[a-z]?\s/i.test(query)) {
-      const name = encodeURIComponent(query.replace(/’/g, "'"));
-      const url = `https://api.geoapify.com/v2/places?categories=catering,commercial&name=${name}&limit=8${bias}${localFilter}&apiKey=${encodeURIComponent(GEOAPIFY_TEST_KEY)}`;
+      const categories = isMcDonalds ? 'catering' : 'catering,commercial';
+      const url = `https://api.geoapify.com/v2/places?categories=${categories}&name=${encodeURIComponent(lookup)}&limit=8${bias}${localFilter}&apiKey=${key}`;
       queries.push((async () => {
         const response = await fetch(url, { signal });
         if (!response.ok) throw new Error('Business search failed');
@@ -1334,25 +1346,32 @@ async function searchPlaces(query, near, signal, nearbyFirst) {
           const point = geometry?.coordinates;
           if (!properties?.name || !Array.isArray(point) ||
               !Number.isFinite(point[0]) || !Number.isFinite(point[1])) return [];
+          if (isMcDonalds && searchName(properties.name) !== 'mcdonalds') return [];
           const address = properties.address_line2 || properties.formatted;
           const label = address && !address.startsWith(properties.name)
             ? `${properties.name}, ${address}` : address || properties.name;
-          return [{ label, point }];
+          return [{ label, point, businessName: properties.name }];
         });
       })());
     }
     const responses = await Promise.allSettled(queries);
     if (signal?.aborted) return [];
+    if (responses.every(({ status }) => status === 'rejected')) throw responses[0].reason;
     const [addresses, businesses = []] = responses.map((result) => result.status === 'fulfilled' ? result.value : []);
-    const nearby = [...businesses, ...addresses];
-    const unique = new Set();
-    const results = nearby.filter(({ point }) => {
-      const key = point.map((value) => value.toFixed(4)).join(',');
-      if (unique.has(key)) return false;
-      unique.add(key);
+    const rank = ({ businessName }) => {
+      if (!businessName) return 0;
+      return searchName(businessName) === name ? 2 : 1;
+    };
+    const nearby = [...businesses, ...addresses].sort((a, b) =>
+      rank(b) - rank(a) || distM(near, a.point) - distM(near, b.point));
+    const seen = new Set();
+    const results = nearby.filter(({ point, businessName }) => {
+      const id = `${point[0].toFixed(4)},${point[1].toFixed(4)}:${searchName(businessName ?? '')}`;
+      if (seen.has(id)) return false;
+      seen.add(id);
       return true;
     });
-    if (results.length) return results.sort((a, b) => distM(near, a.point) - distM(near, b.point)).slice(0, 8);
+    if (results.length || isMcDonalds) return results.slice(0, 8);
   }
   return fetchPlaces();
 }
