@@ -186,10 +186,10 @@ function locateOnRoute(point, lines, offsets, previous) {
   return nearest;
 }
 
-async function planRoadRoute(points, includeSurfaces = false) {
+async function planRoadRoute(points, includeSurfaces = false, throughStops = false) {
   // The Routing API takes latitude first. The response uses GeoJSON order.
   const waypoints = points.map(([lon, lat]) => `${lat},${lon}`).join('|');
-  const query = `waypoints=${encodeURIComponent(waypoints)}&mode=drive&format=geojson&details=instruction_details${includeSurfaces ? ',route_details' : ''}&apiKey=${encodeURIComponent(GEOAPIFY_TEST_KEY)}`;
+  const query = `waypoints=${encodeURIComponent(waypoints)}&mode=drive&format=geojson&details=instruction_details${includeSurfaces ? ',route_details' : ''}${throughStops && points.length > 2 ? '&intermediate_waypoint_mode=through_stop' : ''}&apiKey=${encodeURIComponent(GEOAPIFY_TEST_KEY)}`;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 8000);
   try {
@@ -212,14 +212,14 @@ async function planRoadRoute(points, includeSurfaces = false) {
       .reduce((meters, step) => (
         ['compacted', 'dirt', 'gravel', 'path', 'impassable'].includes(step.surface) ? meters + (step.distance ?? 0) : meters
       ), 0);
-    return { lines: geometry.coordinates.filter((line) => line.length > 1), steps, seconds: feature.properties?.time, unsealed };
+    return { lines: geometry.coordinates.filter((line) => line.length > 1), steps, seconds: feature.properties?.time, unsealed, legs: feature.properties?.legs ?? [] };
   } finally {
     clearTimeout(timeout);
   }
 }
 
-async function buildDirections(here, remaining, plannedRoute) {
-  const { lines, steps: instructions, seconds } = plannedRoute ?? await planRoadRoute([here, ...remaining]);
+async function buildDirections(here, remaining, plannedRoute, throughStops = false) {
+  const { lines, steps: instructions, seconds } = plannedRoute ?? await planRoadRoute([here, ...remaining], false, throughStops);
   const steps = [...instructions];
   if (!lines.length || !steps.length) return null;
   const offsets = routeOffsets(lines);
@@ -229,7 +229,7 @@ async function buildDirections(here, remaining, plannedRoute) {
     steps.push({ point: end, meters: totalMeters, type: 'DestinationReached', text: 'Continue to your destination' });
   }
   return {
-    lines, steps, remaining, offsets, totalMeters, seconds, progress: 0,
+    lines, steps, remaining, offsets, totalMeters, seconds, progress: 0, throughStops,
     index: steps.length > 1 && distM(here, steps[0].point) <= 35 ? 1 : 0,
   };
 }
@@ -269,20 +269,53 @@ const LOOP_MODES = [
   { minutes: 90, color: '#FF526B' },
 ];
 
+const MAIN_ROAD_CLASSES = new Set(['motorway', 'trunk', 'primary', 'secondary']);
+
+function loopBacktracking({ lines, legs, steps }) {
+  const seen = new Set();
+  const pointKey = (point) => point.map((coordinate) => coordinate.toFixed(5)).join(',');
+  let repeated = 0;
+  let distance = 0;
+  let previousEdge;
+  let reverses = steps.some(({ type }) => type === 'TurnAroundLeft' || type === 'TurnAroundRight');
+
+  for (const [legIndex, line] of lines.entries()) {
+    const roadSteps = legs?.[legIndex]?.steps ?? [];
+    let legStep = 0;
+    for (let index = 1; index < line.length; index += 1) {
+      const from = pointKey(line[index - 1]);
+      const to = pointKey(line[index]);
+      if (from === to) continue;
+      const key = from < to ? `${from}|${to}` : `${to}|${from}`;
+      const meters = distM(line[index - 1], line[index]);
+      while (legStep + 1 < roadSteps.length && roadSteps[legStep + 1].from_index <= index - 1) legStep += 1;
+      const mainRoad = MAIN_ROAD_CLASSES.has(roadSteps[legStep]?.road_class);
+      if (previousEdge?.from === to && previousEdge.to === from && meters >= 5) reverses = true;
+      if (seen.has(key)) repeated += meters * (mainRoad ? 0.25 : 1);
+      seen.add(key);
+      distance += meters;
+      previousEdge = { from, to };
+    }
+  }
+  return { reverses, repeatRatio: distance ? repeated / distance : 1 };
+}
+
 async function findExploreLoop(here, minutes, preferSealed, unlocked) {
   const radius = minutes * 190;
   const candidates = await Promise.allSettled([0, 90, 180, 270].map(async (heading, index) => {
     const reach = radius * (index % 2 ? 1.25 : 0.85);
     const waypoints = [here, offsetPoint(here, heading, reach), offsetPoint(here, heading + 65, reach), here];
-    const route = await planRoadRoute(waypoints, preferSealed);
+    const route = await planRoadRoute(waypoints, true, true);
     if (!route.lines.length || !route.steps.length || !(route.seconds > 0)) return null;
+    const { reverses, repeatRatio } = loopBacktracking(route);
+    if (reverses || repeatRatio > 0.35) return null;
     const cells = trailCells(route.lines);
     if (cells.size < 4) return null;
     const novel = [...cells].filter((cell) => !unlocked.has(cell)).length / cells.size;
     const minutesOff = Math.abs(route.seconds / 60 - minutes) / minutes;
     const sealedPenalty = preferSealed ? Math.min(2, route.unsealed / 1000) : 0;
     const meters = routeOffsets(route.lines).at(-1).at(-1);
-    return { route, waypoints, novel, cells, minutesOff, sealedPenalty, meters };
+    return { route, waypoints, novel, cells, minutesOff, sealedPenalty, meters, repeatRatio };
   }));
   return candidates.flatMap((candidate) => candidate.status === 'fulfilled' && candidate.value ? [candidate.value] : []);
 }
@@ -299,10 +332,9 @@ async function findExploreOverview(here, preferSealed, unlockedLines) {
       return overlap / Math.max(cells.size, option.cells.size) > 0.9;
     }));
     const pool = distinct.length ? distinct : eligible;
-    const score = ({ novel, minutesOff, sealedPenalty }) => novel * 2 - minutesOff - sealedPenalty;
-    const best = nearTarget.length
-      ? pool.sort((a, b) => score(b) - score(a))[0]
-      : pool.sort((a, b) => a.minutesOff - b.minutesOff || score(b) - score(a))[0];
+    const score = ({ novel, minutesOff, sealedPenalty, repeatRatio }) =>
+      novel * 2 - minutesOff * 1.5 - sealedPenalty - repeatRatio * 5;
+    const best = pool.sort((a, b) => score(b) - score(a))[0];
     if (best) options.push({ ...mode, ...best });
   }
   return options;
@@ -392,6 +424,7 @@ export default function App() {
   const activeLines = navigation?.lines;
   const arrived = navigation?.arrived;
   const remainingStops = navigation?.remaining;
+  const throughStops = navigation?.throughStops;
   const activeOffsets = navigation?.offsets;
   useEffect(() => {
     if (!activeLines || arrived) return;
@@ -420,7 +453,7 @@ export default function App() {
         rerouting = true;
         setRerouteStatus('Finding a new route…');
         try {
-          const updated = await buildDirections(point, remaining);
+          const updated = await buildDirections(point, remaining, undefined, throughStops);
           if (!active) return;
           if (!offRouteFixes) {
             setRerouteStatus(null);
@@ -451,7 +484,7 @@ export default function App() {
       active = false;
       clearInterval(timer);
     };
-  }, [activeLines, activeOffsets, arrived, remainingStops]);
+  }, [activeLines, activeOffsets, arrived, remainingStops, throughStops]);
   const [savingRoute, setSavingRoute] = useState(false);
   const savingRouteRef = useRef(false);
 
@@ -1012,7 +1045,7 @@ export default function App() {
     setSavingRoute(true);
     try {
       const planned = route.loop && route.waypoints && distM(here, route.waypoints[0]) <= 50 ? route.plannedRoute : undefined;
-      const directions = await buildDirections(here, remaining, planned);
+      const directions = await buildDirections(here, remaining, planned, Boolean(route.loop));
       if (!directions) {
         Alert.alert('Directions unavailable', 'No turn instructions were returned for this route.');
         return;
