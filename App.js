@@ -7,7 +7,7 @@ import { useKeepAwake } from 'expo-keep-awake';
 import * as TaskManager from 'expo-task-manager';
 import * as ImagePicker from 'expo-image-picker';
 import * as Sharing from 'expo-sharing';
-import Svg, { Circle, Polyline } from 'react-native-svg';
+import Svg, { Path, Polyline } from 'react-native-svg';
 import { captureRef, releaseCapture } from 'react-native-view-shot';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import MapLibreGL from '@maplibre/maplibre-react-native';
@@ -2155,21 +2155,27 @@ function speedometerReading(metersPerSecond) {
   return { speed: Math.round(speed), fill: Math.min(1, speed / dialMax) };
 }
 
+const SPEEDOMETER_SIZE = 120;
+
+function speedometerArc(fill) {
+  const center = SPEEDOMETER_SIZE / 2;
+  const radius = 49;
+  const angle = 135 * Math.PI / 180;
+  const sweep = Math.PI * 1.5 * fill;
+  const point = (radians) => `${center + radius * Math.cos(radians)} ${center + radius * Math.sin(radians)}`;
+  return `M ${point(angle)} A ${radius} ${radius} 0 ${sweep > Math.PI ? 1 : 0} 1 ${point(angle + sweep)}`;
+}
+
 function RideSpeedometer({ speed: metersPerSecond }) {
   const { speed, fill } = speedometerReading(metersPerSecond);
-  const radius = 49;
-  const circumference = 2 * Math.PI * radius;
-  const arc = circumference * 0.75;
   return (
     <View style={styles.speedometer} accessible accessibilityLabel={`Current speed ${speed} ${useMiles ? 'miles per hour' : 'kilometres per hour'}`}>
-      <Svg width="100%" height="100%" viewBox="0 0 120 120" style={StyleSheet.absoluteFill} accessible={false}>
-        <Circle cx={60} cy={60} r={radius} stroke="#49414c" strokeWidth={7} fill="none"
-          strokeLinecap="round" strokeDasharray={[arc, circumference]} rotation={135} originX={60} originY={60} />
-        {fill > 0 && (
-          <Circle cx={60} cy={60} r={radius} stroke={PINK} strokeWidth={7} fill="none"
-            strokeLinecap="round" strokeDasharray={[arc * fill, circumference]} rotation={135} originX={60} originY={60} />
-        )}
-      </Svg>
+      <View pointerEvents="none" style={styles.speedometerDial} accessible={false}>
+        <Svg width={SPEEDOMETER_SIZE} height={SPEEDOMETER_SIZE} viewBox={`0 0 ${SPEEDOMETER_SIZE} ${SPEEDOMETER_SIZE}`}>
+          <Path d={speedometerArc(1)} stroke="#49414c" strokeWidth={7} fill="none" strokeLinecap="round" />
+          {fill > 0 && <Path d={speedometerArc(fill)} stroke={PINK} strokeWidth={7} fill="none" strokeLinecap="round" />}
+        </Svg>
+      </View>
       <Text style={styles.speedometerValue} numberOfLines={1} adjustsFontSizeToFit>{speed}</Text>
       <Text style={styles.speedometerUnit}>{speedUnit}</Text>
     </View>
@@ -2198,7 +2204,8 @@ const styles = StyleSheet.create({
   startDirections: { alignSelf: 'center', marginBottom: 8 },
   mapSearch: { marginHorizontal: 16, marginBottom: 10, padding: 15, borderRadius: 16, backgroundColor: PANEL, borderWidth: 1, borderColor: '#555' },
   mapSearchText: { color: '#fff', fontSize: 18, fontWeight: '700' },
-  speedometer: { width: 120, height: 120, borderRadius: 60, backgroundColor: '#17141b', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 18, flexShrink: 0 },
+  speedometer: { width: SPEEDOMETER_SIZE, height: SPEEDOMETER_SIZE, borderRadius: SPEEDOMETER_SIZE / 2, backgroundColor: '#17141b', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 18, flexShrink: 0 },
+  speedometerDial: { position: 'absolute', top: 0, left: 0, width: SPEEDOMETER_SIZE, height: SPEEDOMETER_SIZE },
   speedometerValue: { color: '#fff', fontSize: 41, fontWeight: '800', lineHeight: 47, fontVariant: ['tabular-nums'] },
   speedometerUnit: { color: '#e2c3d5', fontSize: 13, fontWeight: '700' },
   speedometerStandalone: { alignSelf: 'center', marginBottom: 8 },
