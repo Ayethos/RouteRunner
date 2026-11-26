@@ -1261,8 +1261,38 @@ async function searchPlaces(query, near, signal, nearbyFirst) {
 
   if (near && nearbyFirst) {
     const circle = encodeURIComponent(`circle:${near.join(',')},15000`);
-    const local = await fetchPlaces(`&filter=${circle}`);
-    if (local.length) return local.sort((a, b) => distM(near, a.point) - distM(near, b.point));
+    const localFilter = `&filter=${circle}`;
+    const queries = [fetchPlaces(localFilter)];
+    if (!/^\d+[a-z]?\s/i.test(query)) {
+      const name = encodeURIComponent(query.replace(/’/g, "'"));
+      const url = `https://api.geoapify.com/v2/places?categories=catering,commercial&name=${name}&limit=8${bias}${localFilter}&apiKey=${encodeURIComponent(GEOAPIFY_TEST_KEY)}`;
+      queries.push((async () => {
+        const response = await fetch(url, { signal });
+        if (!response.ok) throw new Error('Business search failed');
+        const data = await response.json();
+        return (data.features ?? []).flatMap(({ properties, geometry }) => {
+          const point = geometry?.coordinates;
+          if (!properties?.name || !Array.isArray(point) ||
+              !Number.isFinite(point[0]) || !Number.isFinite(point[1])) return [];
+          const address = properties.address_line2 || properties.formatted;
+          const label = address && !address.startsWith(properties.name)
+            ? `${properties.name}, ${address}` : address || properties.name;
+          return [{ label, point }];
+        });
+      })());
+    }
+    const responses = await Promise.allSettled(queries);
+    if (signal?.aborted) return [];
+    const [addresses, businesses = []] = responses.map((result) => result.status === 'fulfilled' ? result.value : []);
+    const nearby = [...businesses, ...addresses];
+    const unique = new Set();
+    const results = nearby.filter(({ point }) => {
+      const key = point.map((value) => value.toFixed(4)).join(',');
+      if (unique.has(key)) return false;
+      unique.add(key);
+      return true;
+    });
+    if (results.length) return results.sort((a, b) => distM(near, a.point) - distM(near, b.point)).slice(0, 8);
   }
   return fetchPlaces();
 }
