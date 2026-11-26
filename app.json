@@ -18,6 +18,11 @@
     "plugins": [
       "expo-dev-client",
       "@maplibre/maplibre-react-native",
+      ["expo-image-picker", {
+        "cameraPermission": "RouteRunner uses the camera when you take a photo for a ride share card.",
+        "microphonePermission": false,
+        "photosPermission": false
+      }],
       ["expo-location", {
         "isIosBackgroundLocationEnabled": true,
         "locationAlwaysAndWhenInUsePermission": "RouteRunner records your GPS path during a ride you start, even while your screen is locked.",
