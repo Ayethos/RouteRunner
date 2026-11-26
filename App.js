@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { View, Text, Pressable, StyleSheet, Alert, SafeAreaView, Modal, ScrollView, Platform, TextInput, NativeModules, Image, useWindowDimensions } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import * as Location from 'expo-location';
+import { useKeepAwake } from 'expo-keep-awake';
 import * as TaskManager from 'expo-task-manager';
 import * as ImagePicker from 'expo-image-picker';
 import * as Sharing from 'expo-sharing';
@@ -382,6 +383,9 @@ export default function App() {
   const currentPoint = useRef(null);
   const [searchNear, setSearchNear] = useState(null);
   const [navigation, setNavigation] = useState(null);
+  const { height: windowHeight } = useWindowDimensions();
+  const navigating = Boolean(navigation && !navigation.arrived);
+  const navigationInset = navigating && follow ? [Math.round(windowHeight * 0.30), 0, 0, 0] : 0;
   const navigationFix = useRef(null);
   const [rerouteStatus, setRerouteStatus] = useState(null);
 
@@ -1099,8 +1103,10 @@ export default function App() {
   return (
     <View style={styles.root}>
       <StatusBar style="light" />
+      {navigating && <KeepDirectionsAwake />}
       <MapLibreGL.MapView
         key={mapAttempt}
+        contentInset={navigationInset}
         onDidFailLoadingMap={() => setMapFailed(true)}
         onDidFinishLoadingMap={() => setMapFailed(false)}
         style={StyleSheet.absoluteFill}
@@ -1120,7 +1126,8 @@ export default function App() {
         <MapLibreGL.Camera
           ref={cameraRef}
           followUserLocation={follow && hasLiveLocation}
-          followUserMode="normal"
+          followUserMode={navigating ? "course" : "normal"}
+          followHeading={navigating ? undefined : 0}
           followZoomLevel={15}
           defaultSettings={{ centerCoordinate: startupLocation ?? [0, 0], zoomLevel: startupLocation ? 13 : 0 }}
         />
@@ -1610,6 +1617,11 @@ function PlaceSearch({ near, nearbyFirst = false, autoFocus = false, title, plac
       ))}
     </View>
   );
+}
+
+function KeepDirectionsAwake() {
+  useKeepAwake('route-runner-directions', { suppressDeactivateWarnings: true });
+  return null;
 }
 
 function NavigationPanel({ navigation, rerouteStatus, onEnd }) {
