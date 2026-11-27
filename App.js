@@ -1174,6 +1174,7 @@ function RouteRunner({ openAccount }) {
       setRerouteStatus(null);
       setNavigation(directions);
       setFollow(true);
+      if (!ridingRef.current && !finishingRideRef.current) await startRide();
     } catch {
       Alert.alert('Could not start directions', 'Check your connection and try again.');
     } finally {
@@ -1535,7 +1536,7 @@ function RouteRunner({ openAccount }) {
         {routePreview && !navigation && (
           <View style={styles.startDirections}>
             {routePreview.loop && <Text style={styles.loopEstimate}>{Math.round(routePreview.seconds / 60)} min estimated loop</Text>}
-            <Pill label={savingRoute ? 'Loading…' : 'Start directions'} primary disabled={savingRoute}
+            <Pill label={savingRoute ? 'Loading…' : riding ? 'Start directions' : 'Start directions & ride'} primary disabled={savingRoute}
               onPress={() => startDirections(routePreview)} />
           </View>
         )}
@@ -1726,7 +1727,7 @@ function RouteRunner({ openAccount }) {
                     <Text style={styles.rowDetail}>Show on map</Text>
                   </Pressable>
                   <Pressable accessibilityRole="button" disabled={savingRoute} style={styles.placeResult} onPress={() => startDirections(route)}>
-                    <Text style={styles.retryText}>{savingRoute ? 'Working…' : 'Start directions'}</Text>
+                    <Text style={styles.retryText}>{savingRoute ? 'Working…' : riding ? 'Start directions' : 'Start directions & ride'}</Text>
                   </Pressable>
                   <Pressable accessibilityRole="button" disabled={savingRoute} style={styles.placeResult} onPress={() => deleteRoute(route)}>
                     <Text style={styles.rowDetail}>Delete route</Text>
