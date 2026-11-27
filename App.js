@@ -17,7 +17,11 @@ const PINK = '#FF2D95';
 const ROAD_WHITE = '#FFFFFF';
 const PANEL = 'rgba(20,20,22,0.92)';
 
-const MAP_STYLE = 'https://tiles.openfreemap.org/styles/dark';
+const MAP_STYLES = {
+  dark: 'https://tiles.openfreemap.org/styles/dark',
+  light: 'https://tiles.openfreemap.org/styles/positron',
+};
+const MAP_THEME_KEY = 'map-theme:v1';
 const SIMPLIFIED_MAP_KEY = 'simplified-map:v1';
 
 function simplifyMapStyle(style) {
@@ -428,7 +432,12 @@ function RouteRunner({ openAccount, backupActions }) {
   const rideWrites = useRef(Promise.resolve());
   const [libraryView, setLibraryView] = useState(null);
   const [simplifiedMap, setSimplifiedMap] = useState(null);
-  const [simplifiedStyle, setSimplifiedStyle] = useState(null);
+  const [mapTheme, setMapTheme] = useState(null);
+  const [savingMapTheme, setSavingMapTheme] = useState(false);
+  const [simplifiedStyles, setSimplifiedStyles] = useState({});
+  const theme = mapTheme ?? 'dark';
+  const lightMap = theme === 'light';
+  const simplifiedStyle = simplifiedStyles[theme];
   const [simplifiedStyleFailed, setSimplifiedStyleFailed] = useState(false);
   const [styleAttempt, setStyleAttempt] = useState(0);
   const [rideMenu, setRideMenu] = useState(null);
@@ -1276,15 +1285,23 @@ function RouteRunner({ openAccount, backupActions }) {
   }, []);
 
   useEffect(() => {
-    if (!simplifiedMap || simplifiedStyle) return;
+    let active = true;
+    AsyncStorage.getItem(MAP_THEME_KEY).then((value) => {
+      if (active) setMapTheme(value === 'light' ? 'light' : 'dark');
+    }).catch(() => { if (active) setMapTheme('dark'); });
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
+    if (!mapTheme || !simplifiedMap || simplifiedStyle) return;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 8000);
     let active = true;
     setSimplifiedStyleFailed(false);
-    fetch(MAP_STYLE, { signal: controller.signal }).then(async (response) => {
+    fetch(MAP_STYLES[mapTheme], { signal: controller.signal }).then(async (response) => {
       if (!response.ok) throw new Error('Map style unavailable');
       const style = simplifyMapStyle(await response.json());
-      if (active) setSimplifiedStyle(style);
+      if (active) setSimplifiedStyles((current) => ({ ...current, [mapTheme]: style }));
     }).catch(() => { if (active) setSimplifiedStyleFailed(true); })
       .finally(() => clearTimeout(timeout));
     return () => {
@@ -1292,7 +1309,21 @@ function RouteRunner({ openAccount, backupActions }) {
       clearTimeout(timeout);
       controller.abort();
     };
-  }, [simplifiedMap, simplifiedStyle, styleAttempt]);
+  }, [mapTheme, simplifiedMap, simplifiedStyle, styleAttempt]);
+
+  const toggleLightMap = async () => {
+    if (!mapTheme || savingMapTheme) return;
+    const next = lightMap ? 'dark' : 'light';
+    setSavingMapTheme(true);
+    try {
+      await AsyncStorage.setItem(MAP_THEME_KEY, next);
+      setMapTheme(next);
+    } catch {
+      Alert.alert('Could not save map appearance', 'Try again.');
+    } finally {
+      setSavingMapTheme(false);
+    }
+  };
 
   const toggleSimplifiedMap = async () => {
     const next = !simplifiedMap;
@@ -1340,7 +1371,7 @@ function RouteRunner({ openAccount, backupActions }) {
         onDidFailLoadingMap={() => setMapFailed(true)}
         onDidFinishLoadingMap={() => setMapFailed(false)}
         style={StyleSheet.absoluteFill}
-        mapStyle={simplifiedMap && simplifiedStyle ? simplifiedStyle : MAP_STYLE}
+        mapStyle={simplifiedMap && simplifiedStyle ? simplifiedStyle : MAP_STYLES[theme]}
         logoEnabled={false}
         attributionPosition={{ bottom: 8, left: 8 }}
         compassEnabled={false}
@@ -1370,11 +1401,17 @@ function RouteRunner({ openAccount, backupActions }) {
           <MapLibreGL.FillLayer id="explore-dim" style={{ fillColor: '#0b0b0d', fillOpacity: explore ? 0.48 : 0 }} />
         </MapLibreGL.ShapeSource>
         <MapLibreGL.ShapeSource id="trail" shape={fc(trail)}>
+          <MapLibreGL.LineLayer id="trail-light-outline"
+            style={{
+              lineColor: '#535764', lineOpacity: lightMap ? 0.85 : 0,
+              lineCap: 'round', lineJoin: 'round',
+              lineWidth: ['interpolate', ['linear'], ['zoom'], 10, 4, 16, 13],
+            }} />
           <MapLibreGL.LineLayer
             id="trail-glow"
             style={{
               lineColor: ROAD_WHITE,
-              lineOpacity: explore ? 0.5 : 0.25,
+              lineOpacity: lightMap ? 0 : explore ? 0.5 : 0.25,
               lineBlur: 6,
               lineCap: 'round',
               lineJoin: 'round',
@@ -1731,6 +1768,11 @@ function RouteRunner({ openAccount, backupActions }) {
           <ScrollView contentContainerStyle={styles.libraryList}>
             {libraryView === 'settings' ? (
               <>
+                <Pressable accessibilityRole="switch" accessibilityState={{ checked: lightMap, disabled: !mapTheme || savingMapTheme }}
+                  disabled={!mapTheme || savingMapTheme} style={styles.libraryRow} onPress={toggleLightMap}>
+                  <Text style={styles.rowTitle}>Light map · {lightMap ? 'On' : 'Off'}</Text>
+                  <Text style={styles.rowDetail}>Use a white and light-grey basemap.</Text>
+                </Pressable>
                 <Pressable accessibilityRole="switch" accessibilityState={{ checked: simplifiedMap === true }}
                   disabled={simplifiedMap === null} style={styles.libraryRow} onPress={toggleSimplifiedMap}>
                   <Text style={styles.rowTitle}>Simplified map · {simplifiedMap ? 'On' : 'Off'}</Text>
