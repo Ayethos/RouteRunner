@@ -6,6 +6,7 @@ import * as Location from 'expo-location';
 import { useKeepAwake } from 'expo-keep-awake';
 import * as TaskManager from 'expo-task-manager';
 import * as ImagePicker from 'expo-image-picker';
+import * as FileSystem from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 import Svg, { Path, Polyline } from 'react-native-svg';
 import { captureRef, releaseCapture } from 'react-native-view-shot';
@@ -1252,6 +1253,32 @@ function RouteRunner({ openAccount, backupActions }) {
     ]);
   };
 
+  const renameRide = async (ride, title) => {
+    await updateRides((all) => all.map((item) =>
+      rideKey(item) === rideKey(ride) ? { ...item, title } : item));
+  };
+
+  const rememberRidePhoto = async (ride, sourceUri) => {
+    const photoFile = `ride-memory-${rideKey(ride)}-${Date.now()}.jpg`;
+    const uri = ridePhotoUri(photoFile);
+    if (!uri) throw new Error('Photo storage unavailable');
+    let previous;
+    try {
+      await FileSystem.copyAsync({ from: sourceUri, to: uri });
+      await updateRides((all) => {
+        const item = all.find((entry) => rideKey(entry) === rideKey(ride));
+        if (!item) throw new Error('Ride no longer exists');
+        previous = ridePhotoUri(item.photoFile);
+        return all.map((entry) => entry === item ? { ...entry, photoFile } : entry);
+      });
+    } catch (error) {
+      await FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
+      throw error;
+    }
+    if (previous && previous !== uri) await FileSystem.deleteAsync(previous, { idempotent: true }).catch(() => {});
+    return uri;
+  };
+
   const deleteRide = (ride) => {
     const isSameRide = (item) => item && (ride.startedAt != null
       ? item.startedAt === ride.startedAt : item.startedAt == null && item.date === ride.date);
@@ -1259,7 +1286,12 @@ function RouteRunner({ openAccount, backupActions }) {
       { text: 'Cancel', style: 'cancel' },
       { text: 'Delete ride', style: 'destructive', onPress: async () => {
         try {
-          await updateRides((all) => all.filter((item) => !isSameRide(item)));
+          let photo;
+          await updateRides((all) => {
+            photo = ridePhotoUri(all.find(isSameRide)?.photoFile);
+            return all.filter((item) => !isSameRide(item));
+          });
+          if (photo) await FileSystem.deleteAsync(photo, { idempotent: true }).catch(() => {});
           setSelectedRide((selected) => isSameRide(selected) ? null : selected);
         } catch {
           Alert.alert('Could not delete ride', 'Try again.');
@@ -1761,14 +1793,17 @@ function RouteRunner({ openAccount, backupActions }) {
             <Text style={styles.libraryTitle}>{shareRide ? 'Share ride' : rideMenu ? rideTitle(rideMenu) : recapRide ? 'Ride recap' : libraryView === 'privacy' ? 'Privacy' : libraryView === 'settings' ? 'Settings' : libraryView === 'routes' ? 'Saved routes' : 'Ride history'}</Text>
             <RoundBtn label="Back" onPress={closeLibrary} />
           </View>
-          {shareRide ? <RideShare ride={shareRide} /> : rideMenu ? (
+          {shareRide ? (
+            <RideShare ride={rides.find((ride) => rideKey(ride) === rideKey(shareRide)) ?? shareRide}
+              onPhoto={(uri) => rememberRidePhoto(shareRide, uri)} />
+          ) : rideMenu ? (
             <View style={styles.libraryList}>
               <Pill label={rideMenu.pinned ? 'Unpin ride' : 'Pin ride'} onPress={() => pinRide(rideMenu)} />
               <Pill label="Share ride" onPress={() => { setShareRide(rideMenu); setRideMenu(null); }} />
               <Pill label="Delete ride" onPress={() => { deleteRide(rideMenu); setRideMenu(null); }} />
             </View>
           ) : recapRide ? (
-            <RideRecap ride={rides.find((ride) => rideKey(ride) === rideKey(recapRide)) ?? recapRide} onReplay={() => openRide(recapRide)} onShare={() => setShareRide(recapRide)} />
+            <RideRecap ride={rides.find((ride) => rideKey(ride) === rideKey(recapRide)) ?? recapRide} onReplay={() => openRide(recapRide)} onShare={() => setShareRide(recapRide)} onRename={renameRide} />
           ) : (
           <ScrollView contentContainerStyle={styles.libraryList}>
             {libraryView === 'settings' ? (
@@ -2025,7 +2060,13 @@ function NavigationPanel({ navigation, rerouteStatus, onEnd }) {
 
 const rideKey = (ride) => ride.startedAt != null ? `started-${ride.startedAt}` : `saved-${ride.date}`;
 
+function ridePhotoUri(file) {
+  if (typeof file !== 'string' || !/^ride-memory-(?:started|saved)-\d+-\d+\.jpg$/.test(file) || !FileSystem.documentDirectory) return null;
+  return FileSystem.documentDirectory + file;
+}
+
 function rideTitle(ride) {
+  if (ride.title?.trim()) return ride.title.trim();
   const hour = new Date(ride.startedAt ?? ride.date).getHours();
   return `${hour < 5 || hour >= 20 ? 'Night' : hour < 12 ? 'Morning' : hour < 17 ? 'Afternoon' : 'Evening'} ride`;
 }
@@ -2078,7 +2119,23 @@ function RideLine({ paths, thumbnail = false, withPhoto = false, height = '66%' 
   );
 }
 
-function RideRecap({ ride, onReplay, onShare }) {
+function RideRecap({ ride, onReplay, onShare, onRename }) {
+  const [editing, setEditing] = useState(false);
+  const [draftTitle, setDraftTitle] = useState('');
+  const [saving, setSaving] = useState(false);
+  const photo = ridePhotoUri(ride.photoFile);
+  const saveTitle = async () => {
+    if (saving) return;
+    setSaving(true);
+    try {
+      await onRename(ride, draftTitle.trim());
+      setEditing(false);
+    } catch {
+      Alert.alert('Could not save title', 'Try again.');
+    } finally {
+      setSaving(false);
+    }
+  };
   const paths = React.useMemo(() => rideArtwork(ride), [ride]);
   const hasDistance = Number.isFinite(ride.meters);
   const hasDuration = Number.isFinite(ride.seconds);
@@ -2092,7 +2149,7 @@ function RideRecap({ ride, onReplay, onShare }) {
   ];
 
   return (
-    <ScrollView contentContainerStyle={styles.recap}>
+    <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.recap}>
       <View style={styles.recapHero}>
         <View style={styles.recapHeroHeader}>
           <Text accessibilityRole="header" style={styles.recapTitle}>{rideTitle(ride)}</Text>
@@ -2121,8 +2178,19 @@ function RideRecap({ ride, onReplay, onShare }) {
           </View>
         </View>
       )}
+      {editing ? (
+        <View style={styles.libraryRow}>
+          <Text style={styles.rowTitle}>Ride title</Text>
+          <TextInput value={draftTitle} autoFocus editable={!saving} maxLength={60} onChangeText={setDraftTitle}
+            accessibilityLabel="Ride title" placeholder="Leave blank to use the default title"
+            placeholderTextColor="#aaa" style={styles.placeInput} />
+          <Pill label={saving ? 'Saving…' : 'Save title'} primary disabled={saving} onPress={saveTitle} />
+          <Pill label="Cancel" disabled={saving} onPress={() => setEditing(false)} />
+        </View>
+      ) : <Pill label="Customise" onPress={() => { setDraftTitle(ride.title ?? ''); setEditing(true); }} />}
       {paths.length > 0 && <Pill label="Replay on map" primary onPress={onReplay} />}
       <Pill label="Share ride" onPress={onShare} />
+      {photo && <Image source={{ uri: photo }} accessibilityLabel="Photo from this ride" style={styles.rideMemoryPhoto} resizeMode="cover" />}
     </ScrollView>
   );
 }
@@ -2157,10 +2225,10 @@ function RideHistory({ rides, onOpen, onMenu }) {
   );
 }
 
-function RideShare({ ride }) {
+function RideShare({ ride, onPhoto }) {
   const { width } = useWindowDimensions();
-  const [photo, setPhoto] = useState(null);
-  const [photoReady, setPhotoReady] = useState(true);
+  const [photo, setPhoto] = useState(() => ridePhotoUri(ride.photoFile));
+  const [photoReady, setPhotoReady] = useState(() => !ridePhotoUri(ride.photoFile));
   const [busy, setBusy] = useState(false);
   const canvas = useRef(null);
   const working = useRef(false);
@@ -2180,7 +2248,13 @@ function RideShare({ ride }) {
       const result = await ImagePicker.launchCameraAsync({ quality: 0.85, allowsEditing: false });
       if (!result.canceled && result.assets[0]?.uri) {
         setPhotoReady(false);
-        setPhoto(result.assets[0].uri);
+        const snapshot = result.assets[0].uri;
+        try {
+          setPhoto(await onPhoto(snapshot));
+        } catch {
+          setPhoto(snapshot);
+          Alert.alert('Photo could not be saved to the recap', 'You can still use it for this share card.');
+        }
       }
     } catch {
       Alert.alert('Could not open camera', 'Try again, or share with a transparent background.');
@@ -2232,7 +2306,7 @@ function RideShare({ ride }) {
         </View>
       </View>
       <Pill label="Take background photo" disabled={busy} onPress={takePhoto} />
-      {photo && <Pill label="Remove photo" disabled={busy} onPress={() => { setPhoto(null); setPhotoReady(true); }} />}
+      {photo && <Pill label="Use transparent background" disabled={busy} onPress={() => { setPhoto(null); setPhotoReady(true); }} />}
       <Pill label="Share PNG" primary disabled={busy || !photoReady} onPress={share} />
     </ScrollView>
   );
@@ -2366,6 +2440,7 @@ const styles = StyleSheet.create({
     padding: 16,
   },
   libraryTitle: { color: '#fff', fontSize: 25, fontWeight: '700' },
+  rideMemoryPhoto: { width: '100%', aspectRatio: 4 / 3, borderRadius: 18, backgroundColor: '#222227' },
   recap: { padding: 16, gap: 14 },
   recapHero: { padding: 16, borderRadius: 20, borderWidth: 1, borderColor: '#4f2640', backgroundColor: '#20131e', gap: 8 },
   recapHeroHeader: { gap: 4 },
