@@ -33,6 +33,31 @@ async function authRequest(path, payload, token) {
   }
 }
 
+async function roadBackupRequest(path, token, payload) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
+  try {
+    const response = await fetch(`${AUTH_URL}/rest/v1/${path}`, {
+      method: payload ? 'POST' : 'GET',
+      headers: { apikey: AUTH_KEY, Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: payload ? JSON.stringify(payload) : undefined,
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error('Road backup request failed');
+    return payload ? null : response.json();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function isRoadBackup(backup) {
+  return Array.isArray(backup.road_ids) && backup.road_ids.every((id) => typeof id === 'string') &&
+    Array.isArray(backup.lines) && backup.lines.every((line) =>
+      Array.isArray(line) && line.length > 1 && line.every((point) =>
+        Array.isArray(point) && point.length === 2 && point.every(Number.isFinite) &&
+        Math.abs(point[0]) <= 180 && Math.abs(point[1]) <= 90));
+}
+
 function errorMessage(error) {
   if (error.code === 'email_not_confirmed') return 'Confirm your email, then sign in again.';
   if (error.code === 'invalid_credentials') return 'That email or password didn’t match.';
@@ -41,7 +66,7 @@ function errorMessage(error) {
   return 'Account service unavailable. Check your connection or continue as a guest.';
 }
 
-export default function AccountGate({ children }) {
+export default function AccountGate({ children, backupActions }) {
   const [ready, setReady] = useState(false);
   const [guest, setGuest] = useState(false);
   const [session, setSession] = useState(null);
@@ -115,6 +140,51 @@ export default function AccountGate({ children }) {
     }
   };
 
+  const syncRoads = async (mode) => {
+    if (writing.current || !session || !backupActions.current) return;
+    writing.current = true;
+    setBusy(true);
+    setMessage('');
+    try {
+      const refresh = await SecureStore.getItemAsync(SESSION_KEY, secureOptions);
+      if (!refresh) throw new Error('Session unavailable');
+      const refreshed = await authRequest('token?grant_type=refresh_token', { refresh_token: refresh });
+      await SecureStore.setItemAsync(SESSION_KEY, refreshed.refresh_token, secureOptions);
+      setSession(refreshed);
+      if (mode === 'backup') {
+        const local = await backupActions.current.read();
+        const lines = [...new Map(local.lines.map((line) => {
+          const forward = JSON.stringify(line);
+          const reverse = JSON.stringify([...line].reverse());
+          return forward < reverse ? [forward, line] : [reverse, [...line].reverse()];
+        })).values()];
+        if (!lines.length && !local.roadIds.length) {
+          setMessage('There are no unlocked roads on this phone to back up yet.');
+          return;
+        }
+        await roadBackupRequest('rpc/merge_road_backup', refreshed.access_token, {
+          in_lines: lines, in_road_ids: local.roadIds,
+        });
+        setMessage('Unlocked roads backed up to your account.');
+      } else {
+        const rows = await roadBackupRequest('road_backups?select=lines,road_ids&limit=1', refreshed.access_token);
+        const backup = rows?.[0];
+        if (!backup) {
+          setMessage('This account has no road backup yet.');
+          return;
+        }
+        if (!isRoadBackup(backup)) throw new Error('Invalid backup');
+        await backupActions.current.restore(backup);
+        setMessage('Unlocked roads restored and merged with this phone’s map.');
+      }
+    } catch {
+      setMessage('Could not access your road backup. Check your connection and sign-in, then try again.');
+    } finally {
+      writing.current = false;
+      setBusy(false);
+    }
+  };
+
   const signOut = async () => {
     if (writing.current) return;
     writing.current = true;
@@ -152,12 +222,16 @@ export default function AccountGate({ children }) {
           {session ? (
             <>
               <Text style={styles.detail}>{session.user?.email ?? 'Signed in'}</Text>
-              <Text style={styles.detail}>Cloud backup and social features are coming in future updates.</Text>
+              <Text style={styles.detail}>Back up the roads you’ve unlocked to your account. Restore merges them into this phone’s map.</Text>
+              <Action primary label="Back up unlocked roads" disabled={busy} onPress={() => syncRoads('backup')} />
+              <Action label="Restore unlocked roads" disabled={busy} onPress={() => syncRoads('restore')} />
+              {message ? <Text accessibilityLiveRegion="polite" style={styles.message}>{message}</Text> : null}
+              <Text style={styles.detail}>Friends, messaging and shared routes are planned.</Text>
               <Action label={busy ? 'Signing out…' : 'Sign out'} disabled={busy} onPress={signOut} />
             </>
           ) : (
             <>
-              <Text style={styles.detail}>Create a free account to be ready for cloud backups and future social features, including friends, messaging and shared routes with other riders.</Text>
+              <Text style={styles.detail}>Create a free account to back up your unlocked roads and get ready for future social features, including friends, messaging and shared routes with other riders.</Text>
               {!configured && <Text style={styles.detail}>Accounts are unavailable in this build. You can still explore as a guest.</Text>}
               {mode ? (
                 <>
@@ -179,7 +253,7 @@ export default function AccountGate({ children }) {
               )}
               {message ? <Text accessibilityLiveRegion="polite" style={styles.message}>{message}</Text> : null}
               <View style={styles.guest}>
-                <Text style={styles.detail}>Guests can navigate, explore and record rides. Social features will require an account when they launch. Your discovered roads stay on this phone and can be lost if you lose it or delete the app’s data. Cloud backup is not available yet.</Text>
+                <Text style={styles.detail}>Guests can navigate, explore and record rides. Social features will require an account when they launch. Your discovered roads stay on this phone and can be lost if you lose it or delete the app’s data. Sign in to back up your unlocked roads.</Text>
                 <Action disabled={busy} label="Continue as guest" onPress={enterAsGuest} />
               </View>
             </>
