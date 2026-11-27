@@ -1610,6 +1610,9 @@ function RouteRunner({ openAccount, backupActions }) {
 
         {routePreview && !navigation && (
           <View style={styles.startDirections}>
+            {routePreview.id && !routePreview.loop && (
+              <Text style={styles.loopEstimate} numberOfLines={2}>{routePreview.name}</Text>
+            )}
             {routePreview.loop && <Text style={styles.loopEstimate}>{Math.round(routePreview.seconds / 60)} min estimated loop</Text>}
             <Pill label={savingRoute ? 'Loading…' : riding ? 'Start directions' : 'Start directions & ride'} primary disabled={savingRoute}
               onPress={() => startDirections(routePreview)} />
@@ -1799,21 +1802,31 @@ function RouteRunner({ openAccount, backupActions }) {
                 )}
               </View>
             ) : libraryView === 'routes' ? (
-              routes.length ? routes.map((route) => (
-                <View key={route.id} style={styles.libraryRow}>
-                  <Text style={styles.rowTitle}>{route.name}</Text>
-                  <Pressable accessibilityRole="button" disabled={savingRoute} style={styles.placeResult}
-                    onPress={() => { setSelectedRide(null); setNavigation(null); setExplore(false); setRoutePreview({ ...route, lines: route.lines ?? [route.line] }); showOnMap(route.lines ?? [route.line]); }}>
-                    <Text style={styles.rowDetail}>Show on map</Text>
+              routes.length ? routes.map((route) => {
+                const [address, ...locality] = route.name.split(',').map((part) => part.trim());
+                const showRoute = () => {
+                  const lines = route.lines ?? [route.line];
+                  setSelectedRide(null);
+                  setNavigation(null);
+                  setExplore(false);
+                  setRoutePreview({ ...route, lines });
+                  showOnMap(lines);
+                };
+                return (
+                  <Pressable key={route.id} accessibilityRole="button" accessibilityLabel={route.name}
+                    accessibilityHint="Opens the route on the map. Press and hold for delete."
+                    accessibilityActions={[{ name: 'delete', label: 'Delete saved route' }]}
+                    onAccessibilityAction={(event) => { if (event.nativeEvent.actionName === 'delete') deleteRoute(route); }}
+                    disabled={savingRoute} onPress={showRoute} onLongPress={() => deleteRoute(route)}
+                    style={({ pressed }) => [styles.savedRouteCard, pressed && styles.savedRoutePressed]}>
+                    <View style={styles.savedRouteLabels}>
+                      <Text style={styles.savedRouteAddress}>{address || route.name}</Text>
+                      {locality.length > 0 && <Text style={styles.rowDetail}>{locality.join(', ')}</Text>}
+                    </View>
+                    <Text style={styles.savedRouteChevron} accessible={false}>›</Text>
                   </Pressable>
-                  <Pressable accessibilityRole="button" disabled={savingRoute} style={styles.placeResult} onPress={() => startDirections(route)}>
-                    <Text style={styles.retryText}>{savingRoute ? 'Working…' : riding ? 'Start directions' : 'Start directions & ride'}</Text>
-                  </Pressable>
-                  <Pressable accessibilityRole="button" disabled={savingRoute} style={styles.placeResult} onPress={() => deleteRoute(route)}>
-                    <Text style={styles.rowDetail}>Delete route</Text>
-                  </Pressable>
-                </View>
-              )) : <Text style={styles.rowDetail}>No saved routes yet. Use Where to? on the map to plan one.</Text>
+                );
+              }) : <Text style={styles.rowDetail}>No saved routes yet. Use Where to? on the map to plan one.</Text>
             ) : (
               <RideHistory rides={rides} onOpen={setRecapRide} onMenu={setRideMenu} />
             )}
@@ -2382,6 +2395,12 @@ const styles = StyleSheet.create({
   drawer: { flex: 1, width: '78%', maxWidth: 340, backgroundColor: '#19191d', borderRightWidth: 1, borderColor: '#35353d' },
   drawerItem: { minHeight: 54, paddingHorizontal: 14, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: '#25252b', borderRadius: 12 },
   libraryList: { padding: 16, gap: 10 },
+  savedRouteCard: { minHeight: 76, padding: 16, flexDirection: 'row', alignItems: 'center', gap: 12,
+    backgroundColor: '#222227', borderRadius: 16, borderWidth: 1, borderColor: '#3d3a43' },
+  savedRoutePressed: { backgroundColor: '#392231', borderColor: '#FF2D95', transform: [{ scale: 0.985 }] },
+  savedRouteLabels: { flex: 1, gap: 4 },
+  savedRouteAddress: { color: '#fff', fontSize: 19, fontWeight: '700' },
+  savedRouteChevron: { color: '#FF80BE', fontSize: 29, fontWeight: '600' },
   libraryRow: { padding: 16, borderRadius: 14, backgroundColor: PANEL, gap: 5 },
   navigationPanel: { margin: 12, paddingHorizontal: 16, paddingTop: 12, backgroundColor: '#141416', borderRadius: 20 },
   navigationMain: { flexDirection: 'row', alignItems: 'center', gap: 14 },
