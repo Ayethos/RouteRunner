@@ -4,8 +4,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import Svg, { Circle, Defs, LinearGradient, Path, Polyline, Rect, Stop } from 'react-native-svg';
 
-const AUTH_URL = process.env.EXPO_PUBLIC_SUPABASE_URL?.trim().replace(/\/+$/, '');
-const AUTH_KEY = process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY?.trim();
+const AUTH_URL = (process.env.EXPO_PUBLIC_SUPABASE_URL?.trim() || "https://lnxnntzhuzsjultkkbsb.supabase.co").replace(/\/+$/, '');
+const AUTH_KEY = process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY?.trim() || "sb_publishable_TlVEfAPzSkCCbB8ex1el3w_8lip9_xE";
 const configured = Boolean(AUTH_URL?.startsWith('https://') && AUTH_KEY?.startsWith('sb_publishable_'));
 const GUEST_KEY = 'welcome-guest:v1';
 const SESSION_KEY = 'routerunner.refresh.v1';
