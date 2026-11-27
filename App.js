@@ -336,9 +336,9 @@ function loopBacktracking({ lines, legs, steps }) {
 
 async function findExploreLoop(here, minutes, preferSealed, unlocked) {
   const radius = minutes * 190;
-  const candidates = await Promise.allSettled([0, 90, 180, 270].map(async (heading, index) => {
-    const reach = radius * (index % 2 ? 1.25 : 0.85);
-    const waypoints = [here, offsetPoint(here, heading, reach), offsetPoint(here, heading + 65, reach), here];
+  const evaluate = async (heading, scale, spread) => {
+    const reach = radius * scale;
+    const waypoints = [here, offsetPoint(here, heading, reach), offsetPoint(here, heading + spread, reach), here];
     const route = await planRoadRoute(waypoints, true, true);
     if (!route.lines.length || !route.steps.length || !(route.seconds > 0)) return null;
     const { reverses, repeatRatio } = loopBacktracking(route);
@@ -350,8 +350,14 @@ async function findExploreLoop(here, minutes, preferSealed, unlocked) {
     const sealedPenalty = preferSealed ? Math.min(2, route.unsealed / 1000) : 0;
     const meters = routeOffsets(route.lines).at(-1).at(-1);
     return { route, waypoints, novel, cells, minutesOff, sealedPenalty, meters, repeatRatio };
-  }));
-  return candidates.flatMap((candidate) => candidate.status === 'fulfilled' && candidate.value ? [candidate.value] : []);
+  };
+  const collect = async (headings, scales, spreads) => {
+    const attempts = await Promise.allSettled(headings.map((heading, index) => evaluate(heading, scales[index], spreads[index])));
+    return attempts.flatMap((attempt) => attempt.status === 'fulfilled' && attempt.value ? [attempt.value] : []);
+  };
+  const first = await collect([0, 90, 180, 270], [0.85, 1.25, 0.85, 1.25], [65, 65, 65, 65]);
+  if (first.length) return first;
+  return collect([45, 135, 225, 315], [0.68, 0.95, 0.68, 0.95], [80, 100, 80, 100]);
 }
 
 async function findExploreOverview(here, preferSealed, unlockedLines) {
