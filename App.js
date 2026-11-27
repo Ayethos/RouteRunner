@@ -361,7 +361,9 @@ async function findExploreLoop(here, minutes, preferSealed, unlocked) {
   };
   const first = await collect([0, 90, 180, 270], [0.85, 1.25, 0.85, 1.25], [65, 65, 65, 65]);
   if (first.length) return first;
-  return collect([45, 135, 225, 315], [0.68, 0.95, 0.68, 0.95], [80, 100, 80, 100]);
+  const alternatives = await collect([45, 135, 225, 315], [0.68, 0.95, 0.68, 0.95], [80, 100, 80, 100]);
+  if (alternatives.length || minutes !== 90) return alternatives;
+  return collect([20, 110, 200, 290], [0.48, 0.55, 0.48, 0.55], [125, 135, 125, 135]);
 }
 
 async function findExploreOverview(here, preferSealed, unlockedLines) {
@@ -1830,8 +1832,15 @@ function searchName(text) {
 
 async function searchPlaces(query, near, signal, nearbyFirst) {
   const name = searchName(query);
-  const isMcDonalds = ['mcdonald', 'mcdonalds', 'maccas'].includes(name);
-  const lookup = isMcDonalds ? "McDonald's" : query.replace(/’/g, "'");
+  const chain = ['mcdonald', 'mcdonalds', 'maccas'].includes(name) ? "McDonald's"
+    : name === 'kfc' || name === 'kentuckyfriedchicken' ? 'KFC' : null;
+  const lookup = chain ?? query.replace(/’/g, "'");
+  const isChainName = (value) => {
+    const normalized = searchName(value);
+    return chain === 'KFC'
+      ? normalized === 'kentuckyfriedchicken' || /^kfc(?:\b|$)/i.test(value.trim())
+      : normalized === 'mcdonalds' || /^mcdonald['’]s\b/i.test(value.trim());
+  };
   const bias = near ? `&bias=${encodeURIComponent(`proximity:${near.join(',')}`)}` : '';
   const key = encodeURIComponent(GEOAPIFY_TEST_KEY);
   const fetchPlaces = async (filter = '') => {
@@ -1842,18 +1851,18 @@ async function searchPlaces(query, near, signal, nearbyFirst) {
     return (result.results ?? []).flatMap(({ formatted, lon, lat, name: placeName, result_type }) => {
       if (!formatted || !Number.isFinite(lon) || !Number.isFinite(lat)) return [];
       const namedBusiness = result_type === 'amenity' && placeName;
-      if (isMcDonalds && (!namedBusiness || searchName(placeName) !== 'mcdonalds')) return [];
+      if (chain && (!namedBusiness || !isChainName(placeName))) return [];
       return [{ label: formatted, point: [lon, lat], businessName: namedBusiness || null }];
     });
   };
 
-  if (near && (nearbyFirst || isMcDonalds)) {
+  if (near && (nearbyFirst || chain)) {
     const radius = nearbyFirst ? 15000 : 50000;
     const circle = encodeURIComponent(`circle:${near.join(',')},${radius}`);
     const localFilter = `&filter=${circle}`;
     const queries = [fetchPlaces(localFilter)];
     if (!/^\d+[a-z]?\s/i.test(query)) {
-      const categories = isMcDonalds ? 'catering' : 'catering,commercial';
+      const categories = chain ? 'catering' : 'catering,commercial';
       const url = `https://api.geoapify.com/v2/places?categories=${categories}&name=${encodeURIComponent(lookup)}&limit=8${bias}${localFilter}&apiKey=${key}`;
       queries.push((async () => {
         const response = await fetch(url, { signal });
@@ -1863,7 +1872,7 @@ async function searchPlaces(query, near, signal, nearbyFirst) {
           const point = geometry?.coordinates;
           if (!properties?.name || !Array.isArray(point) ||
               !Number.isFinite(point[0]) || !Number.isFinite(point[1])) return [];
-          if (isMcDonalds && searchName(properties.name) !== 'mcdonalds') return [];
+          if (chain && !isChainName(properties.name)) return [];
           const address = properties.address_line2 || properties.formatted;
           const label = address && !address.startsWith(properties.name)
             ? `${properties.name}, ${address}` : address || properties.name;
@@ -1877,7 +1886,7 @@ async function searchPlaces(query, near, signal, nearbyFirst) {
     const [addresses, businesses = []] = responses.map((result) => result.status === 'fulfilled' ? result.value : []);
     const rank = ({ businessName }) => {
       if (!businessName) return 0;
-      return searchName(businessName) === name ? 2 : 1;
+      return (chain ? isChainName(businessName) : searchName(businessName) === name) ? 2 : 1;
     };
     const nearby = [...businesses, ...addresses].sort((a, b) =>
       rank(b) - rank(a) || distM(near, a.point) - distM(near, b.point));
@@ -1888,7 +1897,7 @@ async function searchPlaces(query, near, signal, nearbyFirst) {
       seen.add(id);
       return true;
     });
-    if (results.length || isMcDonalds) return results.slice(0, 8);
+    if (results.length || chain) return results.slice(0, 8);
   }
   return fetchPlaces();
 }
