@@ -384,10 +384,13 @@ const exploreShade = {
 
 // ---- App -----------------------------------------------------------------
 export default function App() {
-  return <AccountGate>{(openAccount) => <RouteRunner openAccount={openAccount} />}</AccountGate>;
+  const backupActions = useRef(null);
+  return <AccountGate backupActions={backupActions}>{(openAccount) => (
+    <RouteRunner openAccount={openAccount} backupActions={backupActions} />
+  )}</AccountGate>;
 }
 
-function RouteRunner({ openAccount }) {
+function RouteRunner({ openAccount, backupActions }) {
   const cameraRef = useRef(null);
   const startupCameraPending = useRef(true);
   const [startupLocation, setStartupLocation] = useState(null);
@@ -572,6 +575,33 @@ function RouteRunner({ openAccount }) {
       setTrailLoaded(true);
     })();
   }, []);
+
+  useEffect(() => {
+    if (!trailLoaded) return;
+    backupActions.current = {
+      read: async () => {
+        await matchQueue.current;
+        return { lines: trailRef.current, roadIds: [...knownRoads.current] };
+      },
+      restore: async (backup) => {
+        const write = matchQueue.current.then(async () => {
+          const lines = [...new Map([...trailRef.current, ...backup.lines].map((line) => {
+            const forward = JSON.stringify(line);
+            const reverse = JSON.stringify([...line].reverse());
+            return [forward < reverse ? forward : reverse, line];
+          })).values()];
+          const roadIds = [...new Set([...knownRoads.current, ...backup.road_ids])];
+          await AsyncStorage.setItem(TRAIL_KEY, JSON.stringify({ lines, roadIds, pending: offlineBatches.current }));
+          knownRoads.current = new Set(roadIds);
+          trailRef.current = lines;
+          setTrail(lines);
+        });
+        matchQueue.current = write.catch(() => {});
+        await write;
+      },
+    };
+    return () => { backupActions.current = null; };
+  }, [trailLoaded, backupActions]);
 
   const updateRides = useCallback((change) => {
     const write = rideWrites.current.then(async () => {
@@ -1710,7 +1740,7 @@ function RouteRunner({ openAccount }) {
             ) : libraryView === 'privacy' ? (
               <View style={styles.libraryRow}>
                 <Text style={styles.rowTitle}>Road discovery</Text>
-                <Text style={styles.rowDetail}>When enabled, GPS points are sent to Geoapify to match the roads you travel. Unmatched points may be stored on this device for retry. Turning discovery off pauses those retries. RouteRunner stores unlocked roads and ride history on this device.</Text>
+                <Text style={styles.rowDetail}>When enabled, GPS points are sent to Geoapify to match the roads you travel. Unmatched points may be stored on this device for retry. Turning discovery off pauses those retries. RouteRunner stores unlocked roads and ride history on this device. If you choose Cloud backup in Account, your unlocked road shapes and IDs are also stored in Supabase for restore.</Text>
                 <Text style={styles.rowDetail}>Destination searches and directions also use Geoapify to look up places and calculate routes when you request them.</Text>
                 {GEOAPIFY_TEST_KEY && (
                   <Pill label={discoveryChoice ? 'Turn off road discovery' : 'Allow road discovery'}
