@@ -237,7 +237,7 @@ function locateOnRoute(point, lines, offsets, previous) {
 async function planRoadRoute(points, includeSurfaces = false, throughStops = false) {
   // The Routing API takes latitude first. The response uses GeoJSON order.
   const waypoints = points.map(([lon, lat]) => `${lat},${lon}`).join('|');
-  const query = `waypoints=${encodeURIComponent(waypoints)}&mode=drive&format=geojson&details=instruction_details${includeSurfaces ? ',route_details' : ''}${throughStops && points.length > 2 ? '&intermediate_waypoint_mode=through_stop' : ''}&apiKey=${encodeURIComponent(GEOAPIFY_TEST_KEY)}`;
+  const query = `waypoints=${encodeURIComponent(waypoints)}&mode=drive&traffic=approximated&format=geojson&details=instruction_details${includeSurfaces ? ',route_details' : ''}${throughStops && points.length > 2 ? '&intermediate_waypoint_mode=through_stop' : ''}&apiKey=${encodeURIComponent(GEOAPIFY_TEST_KEY)}`;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 8000);
   try {
@@ -266,8 +266,40 @@ async function planRoadRoute(points, includeSurfaces = false, throughStops = fal
   }
 }
 
+function routeTiming(offsets, legs) {
+  if (legs?.length !== offsets.length) return [];
+  return offsets.flatMap((points, index) => {
+    const leg = legs[index];
+    const from = points[0];
+    const to = points.at(-1);
+    const steps = (leg.steps ?? []).map((step) => ({
+      from: points[step.from_index], to: points[step.to_index], seconds: step.time,
+    }));
+    const complete = steps.length > 0 && steps[0].from === from && steps.at(-1).to === to &&
+      steps.every((step, position) => Number.isFinite(step.from) && Number.isFinite(step.to) &&
+        step.to >= step.from && Number.isFinite(step.seconds) && step.seconds >= 0 &&
+        (!position || step.from === steps[position - 1].to));
+    if (complete && steps.some((step) => step.seconds > 0)) return steps;
+    return [{ from, to, seconds: leg.time }];
+  });
+}
+
+function remainingTravelSeconds({ timing, seconds, totalMeters, progress }) {
+  if (!(seconds > 0) || !(totalMeters > 0)) return null;
+  const scheduled = timing?.reduce((sum, segment) => sum + segment.seconds, 0);
+  if (!(scheduled > 0) || timing.some((segment) => !Number.isFinite(segment.seconds) || segment.seconds < 0)) {
+    return seconds * (1 - progress / totalMeters);
+  }
+  const remaining = timing.reduce((sum, { from, to, seconds: duration }) => {
+    if (progress >= to) return sum;
+    if (progress <= from) return sum + duration;
+    return sum + duration * (to - progress) / (to - from);
+  }, 0);
+  return remaining * seconds / scheduled;
+}
+
 async function buildDirections(here, remaining, plannedRoute, throughStops = false) {
-  const { lines, steps: instructions, seconds } = plannedRoute ?? await planRoadRoute([here, ...remaining], false, throughStops);
+  const { lines, steps: instructions, seconds, legs } = plannedRoute ?? await planRoadRoute([here, ...remaining], false, throughStops);
   const steps = [...instructions];
   if (!lines.length || !steps.length) return null;
   const offsets = routeOffsets(lines);
@@ -277,7 +309,7 @@ async function buildDirections(here, remaining, plannedRoute, throughStops = fal
     steps.push({ point: end, meters: totalMeters, type: 'DestinationReached', text: 'Continue to your destination' });
   }
   return {
-    lines, steps, remaining, offsets, totalMeters, seconds, progress: 0, throughStops,
+    lines, steps, remaining, offsets, totalMeters, seconds, timing: routeTiming(offsets, legs), progress: 0, throughStops,
     index: steps.length > 1 && distM(here, steps[0].point) <= 35 ? 1 : 0,
   };
 }
@@ -2044,8 +2076,9 @@ function KeepDirectionsAwake() {
 function NavigationPanel({ navigation, rerouteStatus, onEnd }) {
   const step = navigation.steps[navigation.index];
   const remaining = Math.max(0, navigation.totalMeters - navigation.progress);
-  const eta = navigation.seconds > 0 && navigation.totalMeters > 0
-    ? new Date(Date.now() + navigation.seconds * remaining / navigation.totalMeters * 1000)
+  const travelSeconds = remainingTravelSeconds(navigation);
+  const eta = travelSeconds != null
+    ? new Date(Date.now() + travelSeconds * 1000)
       .toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
     : null;
   const status = navigation.arrived ? 'Destination reached' : rerouteStatus;
@@ -2068,7 +2101,7 @@ function NavigationPanel({ navigation, rerouteStatus, onEnd }) {
       <View style={styles.navigationFooter}>
         {!navigation.arrived && (
           <Text style={styles.navigationRemaining}>
-            {formatTurnDistance(remaining)} left{eta ? ` · ETA ${eta}` : ''}
+            {formatTurnDistance(remaining)} left{eta ? ` · Est. arrival ${eta}` : ''}
           </Text>
         )}
         <Pressable accessibilityRole="button" accessibilityLabel="End directions"
