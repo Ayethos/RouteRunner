@@ -1538,22 +1538,26 @@ function RouteRunner({ openAccount, backupActions }) {
 
       {/* Top row */}
       <SafeAreaView pointerEvents="box-none" style={StyleSheet.absoluteFill}>
-        <View style={styles.topRow} pointerEvents="box-none">
-          <Pressable accessibilityRole="button" accessibilityLabel="Open side menu" style={styles.round}
-            onPress={() => setLibraryView('menu')}>
-            <Text style={styles.menuIcon}>☰</Text>
-          </Pressable>
-          <View style={{ flex: 1 }} />
-          <RoundBtn label="Explore" active={explore} onPress={() => {
-            if (findingLoops) return;
-            if (explore && routePreview?.loop) setRoutePreview(null);
-            setExplore(!explore);
-            if (!explore && !navigation && !routePreview) {
-              if (exploreLoops.length) showOnMap(exploreLoops.flatMap(({ route }) => route.lines));
-              else if (currentPoint.current && GEOAPIFY_TEST_KEY) generateLoops();
-            }
-          }} />
-        </View>
+        {navigation ? (
+          <NavigationPanel navigation={navigation} rerouteStatus={rerouteStatus} onEnd={() => setNavigation(null)} />
+        ) : (
+          <View style={styles.topRow} pointerEvents="box-none">
+            <Pressable accessibilityRole="button" accessibilityLabel="Open side menu" style={styles.round}
+              onPress={() => setLibraryView('menu')}>
+              <Text style={styles.menuIcon}>☰</Text>
+            </Pressable>
+            <View style={{ flex: 1 }} />
+            <RoundBtn label="Explore" active={explore} onPress={() => {
+              if (findingLoops) return;
+              if (explore && routePreview?.loop) setRoutePreview(null);
+              setExplore(!explore);
+              if (!explore && !navigation && !routePreview) {
+                if (exploreLoops.length) showOnMap(exploreLoops.flatMap(({ route }) => route.lines));
+                else if (currentPoint.current && GEOAPIFY_TEST_KEY) generateLoops();
+              }
+            }} />
+          </View>
+        )}
 
         {explore && !navigation && !routePreview && (
           <View style={styles.explorePanel}>
@@ -1600,9 +1604,6 @@ function RouteRunner({ openAccount, backupActions }) {
           </View>
         )}
 
-        {navigation && (
-          <NavigationPanel navigation={navigation} rerouteStatus={rerouteStatus} onEnd={() => setNavigation(null)} />
-        )}
         {locatingStartup && !mapFailed && (
           <View style={styles.banner}>
             <Text style={styles.bannerText}>Finding your location…</Text>
