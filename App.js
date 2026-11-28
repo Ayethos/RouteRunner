@@ -44,6 +44,15 @@ function simplifyMapStyle(style) {
 
 const TRAIL_KEY = 'trail:matched:v1';
 const MATCH_INTERVAL_MS = 30_000;
+const LIVE_SPEED_MAX_AGE_MS = 3000;
+
+function liveSpeedSample(location, rideStart, now) {
+  const { speed, accuracy } = location.coords;
+  if (!Number.isFinite(speed) || speed < 0 || !(accuracy > 0 && accuracy <= 30) ||
+      !Number.isFinite(location.timestamp) || location.timestamp < rideStart ||
+      now - location.timestamp > LIVE_SPEED_MAX_AGE_MS) return null;
+  return { speed, timestamp: location.timestamp };
+}
 const GEOAPIFY_TEST_KEY = process.env.EXPO_PUBLIC_GEOAPIFY_TEST_KEY?.trim();
 const ROUTES_KEY = 'routes:v1';
 const DISCOVERY_PERMISSION_KEY = 'discovery-permission:v1';
@@ -459,6 +468,8 @@ function RouteRunner({ openAccount, backupActions }) {
 
   // ride state
   const [riding, setRiding] = useState(false);
+  const latestSpeed = useRef(null);
+  const [liveSpeed, setLiveSpeed] = useState(null);
   const ridingRef = useRef(false);
   const rideStartedAt = useRef(0);
   const finishingRideRef = useRef(false);
@@ -847,7 +858,7 @@ function RouteRunner({ openAccount, backupActions }) {
             setLocatingStartup(false);
           }).catch(() => {});
         sub = await Location.watchPositionAsync(
-          { accuracy: Location.Accuracy.BestForNavigation, distanceInterval: 5, timeInterval: 1000 },
+          { accuracy: Location.Accuracy.BestForNavigation, distanceInterval: 0, timeInterval: 500 },
           (location) => {
             if (!active) return;
             const firstFix = currentPoint.current === null;
@@ -866,6 +877,13 @@ function RouteRunner({ openAccount, backupActions }) {
             if (accuracy > 0 && accuracy <= 35) {
               navigationFix.current = { point: currentPoint.current, accuracy, timestamp: location.timestamp };
               setSearchNear((near) => near ?? currentPoint.current);
+            }
+            if (ridingRef.current) {
+              const reading = liveSpeedSample(location, rideStartedAt.current, Date.now());
+              if (reading && reading.timestamp > (latestSpeed.current?.timestamp ?? 0)) {
+                latestSpeed.current = reading;
+                setLiveSpeed(reading.speed);
+              }
             }
             if (!backgroundRideRef.current) onLocation(location);
           }
@@ -913,6 +931,7 @@ function RouteRunner({ openAccount, backupActions }) {
   useEffect(() => {
     if (!riding) return;
     const id = setInterval(async () => {
+      if (latestSpeed.current && Date.now() - latestSpeed.current.timestamp > LIVE_SPEED_MAX_AGE_MS) setLiveSpeed(null);
       if (backgroundRideRef.current) await drainBackground().catch(() => {});
       if (!ridingRef.current) return;
       statsRef.current.seconds = Math.floor((Date.now() - rideStartedAt.current) / 1000);
@@ -969,6 +988,8 @@ function RouteRunner({ openAccount, backupActions }) {
     setScreenLockRecording(backgroundEnabled);
     setSelectedRide(null);
     lastRecordedTime.current = 0;
+    latestSpeed.current = null;
+    setLiveSpeed(null);
     rideUnlocks.current = new Map();
     appliedRideBatches.current = new Set();
     rideMatchingFailed.current = false;
@@ -1658,7 +1679,7 @@ function RouteRunner({ openAccount, backupActions }) {
         )}
         {riding && (drawing || (routePreview && !navigation)) && (
           <View style={styles.speedometerStandalone} pointerEvents="none">
-            <RideSpeedometer speed={stats.speed} />
+            <RideSpeedometer speed={liveSpeed} />
           </View>
         )}
         {/* Bottom controls */}
@@ -1680,7 +1701,7 @@ function RouteRunner({ openAccount, backupActions }) {
               <View style={styles.speedometerSideLeft}>
                 <RoundBtn label="End ride" onPress={endRide} />
               </View>
-              <RideSpeedometer speed={stats.speed} />
+              <RideSpeedometer speed={liveSpeed} />
               <View style={styles.speedometerSideRight}>
                 <RoundBtn label="Locate" active={follow} onPress={() => setFollow(true)} />
               </View>
@@ -2345,15 +2366,16 @@ function speedometerArc(fill) {
 
 function RideSpeedometer({ speed: metersPerSecond }) {
   const { speed, fill } = speedometerReading(metersPerSecond);
+  const hasSpeed = metersPerSecond != null;
   return (
-    <View style={styles.speedometer} accessible accessibilityLabel={`Current speed ${speed} ${useMiles ? 'miles per hour' : 'kilometres per hour'}`}>
+    <View style={styles.speedometer} accessible accessibilityLabel={hasSpeed ? `Current speed ${speed} ${useMiles ? 'miles per hour' : 'kilometres per hour'}` : 'Waiting for GPS speed'}>
       <View pointerEvents="none" style={styles.speedometerDial} accessible={false}>
         <Svg width={SPEEDOMETER_SIZE} height={SPEEDOMETER_SIZE} viewBox={`0 0 ${SPEEDOMETER_SIZE} ${SPEEDOMETER_SIZE}`}>
           <Path d={speedometerArc(1)} stroke="#49414c" strokeWidth={7} fill="none" strokeLinecap="round" />
           {fill > 0 && <Path d={speedometerArc(fill)} stroke={PINK} strokeWidth={7} fill="none" strokeLinecap="round" />}
         </Svg>
       </View>
-      <Text style={styles.speedometerValue} numberOfLines={1} adjustsFontSizeToFit>{speed}</Text>
+      <Text style={styles.speedometerValue} numberOfLines={1} adjustsFontSizeToFit>{hasSpeed ? speed : '–'}</Text>
       <Text style={styles.speedometerUnit}>{speedUnit}</Text>
     </View>
   );
